@@ -20,8 +20,9 @@ Pipfile.lock
 
 # 資料集（體積大，不納入版控）
 KEEL_Dataset/
-data/
 preTraData/
+data/
+data_260324/
 
 # 輸出結果（可重新產生）
 results/
