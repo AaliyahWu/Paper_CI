@@ -246,7 +246,8 @@ if __name__ == '__main__':
 
     df_all, df_hard = run_all_keel(KEEL_ROOT, threshold=0.7)
 
-    out_xlsx = 'occ_auc_results.xlsx'
+    os.makedirs('results', exist_ok=True)
+    out_xlsx = 'results/occ_auc_results.xlsx'
     with pd.ExcelWriter(out_xlsx, engine='openpyxl') as writer:
         df_all.to_excel(writer,  sheet_name='all',  index=False)
         df_hard.to_excel(writer, sheet_name='hard', index=False)

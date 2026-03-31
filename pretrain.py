@@ -29,7 +29,7 @@ np.random.seed(42)
 # ─────────────────────────────────────────
 # 設定
 # ─────────────────────────────────────────
-DATA_DIR    = "./keel_data"
+DATA_DIR    = "./preTraData"
 RESULTS_DIR = "./results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -224,6 +224,27 @@ def load_keel_dat(filepath):
     return X, y
 
 
+def scan_pretrain_folds(root_dir):
+    """
+    掃描 preTraData/ 下每個子資料夾，
+    找出所有 *tra.dat / *tst.dat 配對（只看直接層檔案，不進子資料夾）。
+    回傳 dict { dataset_name: [(tra_path, tst_path), ...] }
+    """
+    dataset_folds = {}
+    for ds_name in sorted(os.listdir(root_dir)):
+        ds_path = os.path.join(root_dir, ds_name)
+        if not os.path.isdir(ds_path):
+            continue
+        files = [f for f in os.listdir(ds_path)
+                 if f.endswith('.dat') and os.path.isfile(os.path.join(ds_path, f))]
+        tra = sorted([os.path.join(ds_path, f) for f in files if 'tra.dat' in f])
+        tst = sorted([os.path.join(ds_path, f) for f in files if 'tst.dat' in f])
+        pairs = list(zip(tra, tst))
+        if pairs:
+            dataset_folds[ds_name] = pairs
+    return dataset_folds
+
+
 def compute_ir(y):
     n_min = y.sum()
     n_maj = len(y) - n_min
@@ -298,42 +319,72 @@ def pick_representative(selected):
 # ─────────────────────────────────────────
 # 前測主流程
 # ─────────────────────────────────────────
-def run_pretrain(reps):
+def run_pretrain(dataset_folds):
+    """
+    dataset_folds: dict { ds_name: [(tra_path, tst_path), ...] }
+    每個資料集做 5-fold：用 tra 的 normal 樣本訓練 AE，在 tst 上評估 OCC AUC。
+    """
     all_rows = []
 
-    for (ds_name, fp, X, y, ir) in reps:
-        input_dim = X.shape[1]
+    for ds_name, fold_pairs in dataset_folds.items():
+        # 用第一個 fold 的 tra 取得 input_dim 和 IR
+        try:
+            X0, _ = load_keel_dat(fold_pairs[0][0])
+            input_dim = X0.shape[1]
+            all_y = np.concatenate([load_keel_dat(tp)[1] for tp, _ in fold_pairs])
+            ir = compute_ir(all_y)
+        except Exception as e:
+            print(f"\n[跳過] {ds_name} meta 載入失敗: {e}")
+            continue
+
         ae_configs = get_ae_configs(input_dim)
-
         print(f"\n{'='*60}")
-        print(f"資料集：{ds_name}  shape={X.shape}  IR={ir:.1f}  input_dim={input_dim}")
-        print(f"架構候選：{[(c[2], c[1]) for c in ae_configs]}")
+        print(f"資料集：{ds_name}  folds={len(fold_pairs)}  IR={ir:.1f}  input_dim={input_dim}")
         print(f"{'='*60}")
-
-        sc = MinMaxScaler()
-        X_s   = sc.fit_transform(X)
-        X_maj = X_s[y == 0]
 
         for ae_type in AE_TYPES:
             for (n_layers, n_units, cfg_label) in ae_configs:
                 print(f"  [{ae_type}] {cfg_label}(units={n_units}) ", end="", flush=True)
-                try:
-                    feat_maj, feat_all = train_and_extract(ae_type, X_maj, X_s, n_layers, n_units)
-                    row = {"dataset": ds_name, "input_dim": input_dim,
-                           "IR": round(ir, 2), "AE_type": ae_type,
-                           "config": cfg_label, "n_units": n_units}
-                    for occ in OCC_TYPES:
-                        auc = run_occ(occ, feat_maj, feat_all, y)
-                        row[occ] = round(auc, 3) if not np.isnan(auc) else "-"
-                        print(f"{occ}={row[occ]} ", end="", flush=True)
-                    print()
-                    all_rows.append(row)
-                except Exception as e:
-                    print(f"[Error] {e}")
+                fold_aucs = {occ: [] for occ in OCC_TYPES}
+
+                for tra_path, tst_path in fold_pairs:
+                    try:
+                        X_tra, y_tra = load_keel_dat(tra_path)
+                        X_tst, y_tst = load_keel_dat(tst_path)
+                        if y_tst.sum() < 1:
+                            continue
+
+                        sc = MinMaxScaler()
+                        X_tra_s = sc.fit_transform(X_tra)
+                        X_tst_s = sc.transform(X_tst)
+                        X_maj   = X_tra_s[y_tra == 0]
+                        if len(X_maj) < 5:
+                            continue
+
+                        feat_maj, feat_tst = train_and_extract(
+                            ae_type, X_maj, X_tst_s, n_layers, n_units)
+
+                        for occ in OCC_TYPES:
+                            auc = run_occ(occ, feat_maj, feat_tst, y_tst)
+                            if not np.isnan(auc):
+                                fold_aucs[occ].append(auc)
+                    except Exception as e:
+                        print(f"[fold err: {e}] ", end="", flush=True)
+
+                row = {"dataset": ds_name, "input_dim": input_dim,
+                       "IR": round(ir, 2), "AE_type": ae_type,
+                       "config": cfg_label, "n_units": n_units}
+                for occ in OCC_TYPES:
+                    val = round(np.mean(fold_aucs[occ]), 3) if fold_aucs[occ] else "-"
+                    row[occ] = val
+                    print(f"{occ}={val} ", end="", flush=True)
+                print()
+                all_rows.append(row)
 
     df = pd.DataFrame(all_rows)
-    df.to_csv(os.path.join(RESULTS_DIR, "pretrain_results.csv"), index=False, encoding="utf-8-sig")
-    print(f"\n✅ 結果儲存：{RESULTS_DIR}/pretrain_results.csv")
+    out_path = os.path.join(RESULTS_DIR, "pretrain_results.xlsx")
+    df.to_excel(out_path, index=False, engine="openpyxl")
+    print(f"\n✅ 結果儲存：{out_path}")
     return df
 
 
@@ -386,26 +437,24 @@ def make_fig2_table(df, tag="avg"):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    print("【步驟 1】篩選資料集")
-    selected = select_datasets(DATA_DIR)
-    if not selected:
-        print("\n請將 KEEL .dat 檔放入 ./keel_data/ 後重新執行。")
-        print("下載網址：https://sci2s.ugr.es/keel/imbalanced.php")
+    print("【步驟 1】掃描 preTraData 資料集")
+    dataset_folds = scan_pretrain_folds(DATA_DIR)
+    if not dataset_folds:
+        print(f"\n請確認 {DATA_DIR}/ 下有含 tra.dat/tst.dat 的子資料夾。")
         exit(0)
+    print(f"找到 {len(dataset_folds)} 個資料集：{list(dataset_folds.keys())}")
 
-    print("\n【步驟 2】選取代表性資料集")
-    reps = pick_representative(selected)
+    print("\n【步驟 2】AE 架構前測 × OCC 前測（5-fold）")
+    results_df = run_pretrain(dataset_folds)
 
-    print("\n【步驟 3/4】AE 架構前測 × OCC 前測")
-    results_df = run_pretrain(reps)
-
-    print("\n【步驟 5】最佳參數")
+    print("\n【步驟 3】最佳參數")
     summarize_best(results_df)
 
-    print("\n【步驟 6】圖二格式表")
-    for rep in reps:
-        sub = results_df[results_df["dataset"] == rep[0]]
-        make_fig2_table(sub, tag=rep[0])
+    print("\n【步驟 4】圖二格式表")
+    for ds_name in dataset_folds:
+        sub = results_df[results_df["dataset"] == ds_name]
+        if not sub.empty:
+            make_fig2_table(sub, tag=ds_name)
     make_fig2_table(results_df, tag="average")
 
     print("\n✅ 前測全部完成！請查看 ./results/ 資料夾。")
