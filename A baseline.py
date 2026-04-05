@@ -454,7 +454,7 @@ def save_excel(df):
 # ─────────────────────────── Entry Point ─────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
-    print("A Baseline：OCC 三模型評估（OCSVM / LOF / Isolation Forest）")
+    print("Baseline A：OCC 三模型評估（OCSVM / LOF / Isolation Forest）")
     print("=" * 60)
 
     df_results = run_experiment()
