@@ -203,20 +203,16 @@ def gmean_score(y_true, y_pred_binary):
 
 def run_occ_eval(occ_type, feat_maj, feat_test, y_test, n_neighbors_cap):
     """
-    在提取後的特徵空間訓練 OCC（只用 majority/normal 特徵），
+    在 AE 提取後的特徵空間訓練 OCC（只用 majority/normal 特徵），
     對 test set 計算 AUC、F1、Recall、G-mean。
 
-    y_test：0=normal(majority), 1=anomaly(minority)
+    y_test  : 1=minority(anomaly), 0=majority(normal)
 
-    【修正說明】
-    原始做法用 clf.predict() 的內建 threshold 做二元判斷。
-    但 OCC 的 threshold 是在原始特徵空間校準的，套用到 AE 特徵空間後
-    分佈完全不同，導致幾乎所有樣本都被判為 normal，F1/Recall/G-mean 歸零。
-
-    修正做法：用連續 anomaly score 搭配資料驅動的 threshold。
-    以 majority 訓練樣本在 test 時的 score 分佈的第 95 百分位數作為門檻：
-    高於此門檻的 test 樣本判為 anomaly（minority）。
-    這符合 OCC 的設計邏輯（只有正常資料的資訊），且自適應於特徵空間。
+    Threshold 設定（訓練集 majority 分數第 90 百分位數）：
+      與 Baseline A 相同做法。predict() 的內建 threshold 在某些 fold
+      會使 test set 預測為 anomaly 的數量為 0（AUC > 0.6 但 F1=0）。
+      改用 training majority anomaly score 的第 90 百分位數作為 threshold，
+      對應 contamination=0.1 語義，跨 fold 穩定一致。
     """
     scaler      = MinMaxScaler()
     feat_maj_s  = scaler.fit_transform(feat_maj)
@@ -225,12 +221,12 @@ def run_occ_eval(occ_type, feat_maj, feat_test, y_test, n_neighbors_cap):
     if occ_type == "OCSVM":
         clf = OneClassSVM(nu=0.1, kernel="rbf")
         clf.fit(feat_maj_s)
-        scores_maj  = -clf.decision_function(feat_maj_s)   # higher → more anomalous
+        scores_maj  = -clf.decision_function(feat_maj_s)
         scores_test = -clf.decision_function(feat_test_s)
 
     elif occ_type == "LOF":
         k = min(20, n_neighbors_cap)
-        clf = LocalOutlierFactor(n_neighbors=k, novelty=True)
+        clf = LocalOutlierFactor(n_neighbors=k, novelty=True, contamination=0.1)
         clf.fit(feat_maj_s)
         scores_maj  = -clf.decision_function(feat_maj_s)
         scores_test = -clf.decision_function(feat_test_s)
@@ -241,9 +237,8 @@ def run_occ_eval(occ_type, feat_maj, feat_test, y_test, n_neighbors_cap):
         scores_maj  = -clf.decision_function(feat_maj_s)
         scores_test = -clf.decision_function(feat_test_s)
 
-    # 以 majority 訓練樣本分數的第 95 百分位數作為 threshold（資料驅動）
-    # 超過此值視為 anomaly（minority=1），否則為 normal（majority=0）
-    threshold = np.percentile(scores_maj, 95)
+    # threshold：training majority 分數的第 90 百分位數（與 Baseline A 一致）
+    threshold = np.percentile(scores_maj, 90)
     y_pred = (scores_test >= threshold).astype(int)
 
     try:
