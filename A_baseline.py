@@ -11,7 +11,7 @@ baseline A_scaled.py
       X_tst_scaled = scaler.transform(X_tst)            # transform test
   - evaluate() 接收已 scaled 的資料，邏輯不變
 
-輸出：results/A baseline_scaled.xlsx
+輸出：results/A baseline.xlsx
 """
 
 import os
@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # ─────────────────────────── 路徑設定 ────────────────────────────────────────
 DATA_ROOT = Path("data")          # 修改為你的資料根目錄
 OUTPUT_DIR = Path("results")
-OUTPUT_FILE = OUTPUT_DIR / "A baseline_scaled.xlsx"
+OUTPUT_FILE = OUTPUT_DIR / "A baseline.xlsx"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 N_FOLDS = 5
