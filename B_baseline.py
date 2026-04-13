@@ -48,7 +48,7 @@ np.random.seed(42)
 # ─────────────────────────── 路徑設定 ────────────────────────────────────────
 DATA_ROOT   = Path("data")
 RESULTS_DIR = Path("results")
-BEST_PARAMS = RESULTS_DIR / "best_params.csv"
+BEST_PARAMS = RESULTS_DIR / "best_params_B.csv"
 OUTPUT_FILE = RESULTS_DIR / "B baseline.xlsx"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 

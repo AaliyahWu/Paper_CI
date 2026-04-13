@@ -16,7 +16,7 @@ OF_maj + DF_maj → OCC3
 
 AE 類型：AE, DAE, SAE, VAE
 OCC 方法：OCSVM, LOF, iForest
-最佳參數：results/best_params.csv（與 Baseline B 相同來源）
+最佳參數：results/best_params_C.csv（C 專屬前測結果，由 pretrain_C.py 產生）
 
 輸出：results/C baseline.xlsx
   分頁：per_fold  /  summary  /  overall_mean
@@ -57,7 +57,7 @@ np.random.seed(42)
 # ─────────────────────────── 路徑設定 ────────────────────────────────────────
 DATA_ROOT   = Path("data")
 RESULTS_DIR = Path("results")
-BEST_PARAMS = RESULTS_DIR / "best_params.csv"
+BEST_PARAMS = RESULTS_DIR / "best_params_C.csv"
 OUTPUT_FILE = RESULTS_DIR / "C baseline.xlsx"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -632,6 +632,7 @@ if __name__ == "__main__":
     print("原始特徵（OF_maj）+ AE 深度特徵（DF_maj）拼接 → OCC 評估")
     print("AE  類型：AE / DAE / SAE / VAE")
     print("OCC 方法：OCSVM / LOF / iForest")
+    print("最佳參數來源：results/best_params_C.csv（C 專屬前測）")
     print("=" * 65)
 
     best_params_map = load_best_params()
