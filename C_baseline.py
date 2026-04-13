@@ -17,6 +17,7 @@ OF_maj + DF_maj → OCC3
 AE 類型：AE, DAE, SAE, VAE
 OCC 方法：OCSVM, LOF, iForest
 最佳參數：results/best_params_C.csv（C 專屬前測結果，由 pretrain_C.py 產生）
+            支援 config 格式 h{N}-{ratio}，ratio 可為 1/4、1/3、1/2、1/1（壓縮）或 2/1、3/1、4/1（擴展）
 
 輸出：results/C baseline.xlsx
   分頁：per_fold  /  summary  /  overall_mean
@@ -75,8 +76,16 @@ AE_TYPES  = ["AE", "DAE", "SAE", "VAE"]
 OCC_TYPES = ["OCSVM", "LOF", "iForest"]
 METRIC_COLS = ["AUC", "F1", "Recall", "G-mean"]
 
-# 瓶頸比例標籤 → 實際比例（與 Baseline B 一致）
-BOTTLENECK_RATIOS = {"1/4": 0.25, "1/3": 1/3, "1/2": 0.5, "1/1": 1.0}
+# 比例標籤 → 實際倍率（含瓶頸壓縮 1/N 與擴展 N/1，與 pretrain_C 一致）
+BOTTLENECK_RATIOS = {
+    "1/4": 0.25,
+    "1/3": 1/3,
+    "1/2": 0.5,
+    "1/1": 1.0,
+    "2/1": 2.0,
+    "3/1": 3.0,
+    "4/1": 4.0,
+}
 
 
 # ─────────────────────────── 讀取最佳參數 ────────────────────────────────────
@@ -85,11 +94,14 @@ def load_best_params():
     df = pd.read_csv(BEST_PARAMS)
     mapping = {}
     for _, row in df.iterrows():
-        cfg = str(row["best_config"]).strip()   # e.g. "h2-1/3"
+        cfg = str(row["best_config"]).strip()   # e.g. "h3-3/1", "h2-1/2"
         m = re.match(r"h(\d+)-(.+)", cfg)
         if m:
             n_layers    = int(m.group(1))
-            ratio_label = m.group(2)            # "1/4", "1/3", "1/2", "1/1"
+            ratio_label = m.group(2)            # "1/4", "1/3", "1/2", "1/1", "2/1", "3/1", "4/1"
+            if ratio_label not in BOTTLENECK_RATIOS:
+                print(f"  [WARNING] 未知的比例標籤 '{ratio_label}'（config={cfg}），將跳過此組合")
+                continue
             mapping[(str(row["AE"]).strip(), str(row["OCC"]).strip())] = (n_layers, ratio_label)
     return mapping
 
@@ -386,7 +398,7 @@ def run_experiment(best_params_map):
                         continue
 
                     n_layers, ratio_label = best_params_map[key]
-                    ratio     = BOTTLENECK_RATIOS.get(ratio_label, 1/3)
+                    ratio     = BOTTLENECK_RATIOS[ratio_label]   # KeyError if unknown（已在 load_best_params 過濾）
                     n_units   = max(2, round(input_dim * ratio))
                     cfg_label = f"h{n_layers}-{ratio_label}"
 
@@ -633,12 +645,15 @@ if __name__ == "__main__":
     print("AE  類型：AE / DAE / SAE / VAE")
     print("OCC 方法：OCSVM / LOF / iForest")
     print("最佳參數來源：results/best_params_C.csv（C 專屬前測）")
+    print("Config 格式：h{層數}-{ratio}，ratio 支援 1/4~1/1（壓縮）及 2/1~4/1（擴展）")
     print("=" * 65)
 
     best_params_map = load_best_params()
     print(f"\n已載入最佳參數（共 {len(best_params_map)} 組）：")
+    print(f"  {'AE':<6}{'OCC':<10}{'best_config':<14}{'ratio'}")
+    print(f"  {'-'*4:<6}{'-'*8:<10}{'-'*11:<14}{'-'*5}")
     for (ae, occ), (nl, rl) in sorted(best_params_map.items()):
-        print(f"  {ae:4s} × {occ:8s}  =>  h{nl}-{rl}")
+        print(f"  {ae:<6}{occ:<10}h{nl}-{rl:<13}{rl}")
 
     print()
     df_results = run_experiment(best_params_map)
