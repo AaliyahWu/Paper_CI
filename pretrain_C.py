@@ -48,9 +48,9 @@ DATA_DIR    = "./preTraData"
 RESULTS_DIR = "./results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-HIDDEN_LAYERS     = [2, 3]
-BOTTLENECK_RATIOS = [1/4, 1/3, 1/2, 1/1]
-RATIO_LABELS      = ["1/4", "1/3", "1/2", "1/1"]
+HIDDEN_LAYERS     = [1, 2, 3]
+BOTTLENECK_RATIOS = [1/4, 1/3, 1/2, 1/1, 2/1, 3/1, 4/1]
+RATIO_LABELS      = ["1/4", "1/3", "1/2", "1/1", "2/1", "3/1", "4/1"]
 
 AE_TYPES  = ["AE", "DAE", "SAE", "VAE"]
 OCC_TYPES = ["OCSVM", "LOF", "iForest"]
