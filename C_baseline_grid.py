@@ -75,8 +75,17 @@ OCC_TYPES   = ["OCSVM", "LOF", "iForest"]
 METRIC_COLS = ["AUC", "F1", "Recall", "G-mean"]
 
 N_LAYERS_LIST     = [1, 2, 3]
-BOTTLENECK_RATIOS = {"1/4": 0.25, "1/3": 1/3, "1/2": 0.5, "1/1": 1.0}
-ALL_CONFIGS       = [f"h{nl}-{rl}" for nl in N_LAYERS_LIST for rl in BOTTLENECK_RATIOS]
+BOTTLENECK_RATIOS = {
+    "1/4": 0.25,   # DF 佔 combined 20%  (與 B 相同)
+    "1/3": 1/3,    # DF 佔 combined 25%  (與 B 相同)
+    "1/2": 0.5,    # DF 佔 combined 33%  (與 B 相同)
+    "1/1": 1.0,    # DF 佔 combined 50%  (與 B 相同)
+    "2/1": 2.0,    # DF 佔 combined 67%  (C 新增)
+    "3/1": 3.0,    # DF 佔 combined 75%  (C 新增)
+    "4/1": 4.0,    # DF 佔 combined 80%  (C 新增)
+}
+ALL_CONFIGS = [f"h{nl}-{rl}" for nl in N_LAYERS_LIST for rl in BOTTLENECK_RATIOS]
+# 共 3 × 7 = 21 種組合
 
 
 # ─────────────────────────── AE 模型定義 ─────────────────────────────────────
@@ -337,7 +346,8 @@ def run_experiment():
                             ae_type, X_maj_s, X_tst_s, n_layers, n_units)
                         X_comb_maj  = np.hstack([X_maj_s, feat_maj])
                         X_comb_test = np.hstack([X_tst_s, feat_tst])
-                        comb_features[(n_layers, ratio_label)] = (X_comb_maj, X_comb_test)
+                        combined_dim = X_comb_maj.shape[1]
+                        comb_features[(n_layers, ratio_label)] = (X_comb_maj, X_comb_test, combined_dim)
                     except Exception as e:
                         print(f"  [ERROR] AE={ae_type} h{n_layers}-{ratio_label} Fold{fold}: {e}")
 
@@ -345,7 +355,7 @@ def run_experiment():
                     best_auc = -1.0
                     best_row = None
 
-                    for (n_layers, ratio_label), (X_comb_maj, X_comb_test) in comb_features.items():
+                    for (n_layers, ratio_label), (X_comb_maj, X_comb_test, combined_dim) in comb_features.items():
                         cfg_label = f"h{n_layers}-{ratio_label}"
                         try:
                             metrics = run_occ_eval(
@@ -355,14 +365,15 @@ def run_experiment():
                             metrics = {m: float("nan") for m in METRIC_COLS}
 
                         row = {
-                            "Dataset": ds_name,
-                            "AE":      ae_type,
-                            "OCC":     occ_type,
-                            "Config":  cfg_label,
-                            "Fold":    fold,
+                            "Dataset":      ds_name,
+                            "AE":           ae_type,
+                            "OCC":          occ_type,
+                            "Config":       cfg_label,
+                            "Fold":         fold,
+                            "Combined_Dim": combined_dim,
                             **metrics,
                         }
-                        all_records.append(row)   # ← 每筆都記錄
+                        all_records.append(row)
 
                         auc = metrics["AUC"] if not np.isnan(metrics["AUC"]) else -1.0
                         if auc > best_auc:
@@ -372,7 +383,8 @@ def run_experiment():
                     if best_row is not None:
                         best_records.append(best_row)
                         print(
-                            f"  {ae_type:4s}×{occ_type:8s} best={best_row['Config']:12s} Fold{fold}  "
+                            f"  {ae_type:4s}×{occ_type:8s} best={best_row['Config']:12s} "
+                            f"dim={best_row['Combined_Dim']:3d} Fold{fold}  "
                             f"AUC={best_row['AUC']:.4f}  F1={best_row['F1']:.4f}  "
                             f"Recall={best_row['Recall']:.4f}  G-mean={best_row['G-mean']:.4f}"
                         )
@@ -420,7 +432,7 @@ def col_w(ws, col_letter, width):
 # ─────────────────────────── per_fold 分頁 ───────────────────────────────────
 def write_per_fold(ws, df, title):
     ws.title = title
-    headers = ["Dataset", "AE", "OCC", "Config", "Fold"] + METRIC_COLS
+    headers = ["Dataset", "AE", "OCC", "Config", "Fold", "Combined_Dim"] + METRIC_COLS
 
     for c, h in enumerate(headers, 1):
         sc(ws.cell(1, c), h, font=HEADER_FONT, fill=HEADER_FILL, align=CENTER_ALIGN)
@@ -433,7 +445,7 @@ def write_per_fold(ws, df, title):
                align=LEFT_ALIGN if c <= 2 else CENTER_ALIGN,
                fmt="0.0000" if col in METRIC_COLS else None)
 
-    for i, w in enumerate([28, 6, 10, 14, 6, 10, 10, 10, 10], 1):
+    for i, w in enumerate([28, 6, 10, 14, 6, 12, 10, 10, 10, 10], 1):
         col_w(ws, get_column_letter(i), w)
     ws.freeze_panes = "A2"
 
