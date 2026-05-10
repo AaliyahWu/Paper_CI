@@ -16,23 +16,26 @@ Ensemble 方法二：pairs of OCCs by weighted voting（對應投影片 "b. pair
            本版每個 variant 都用自己的連續分數取 90th percentile 當 threshold，
            再轉成各自獨立的 binary predictions，確保四個指標都正確。
 
-  [修正 3] 移除有誤導性的 hard voting（OR，>=1）
-           兩人 hard voting 以 OR（>=1 票即 anomaly）嚴重 over-predict。
-           本版改為純 soft voting，以連續加權分數決策，
-           更符合「weighted voting」的語義，也避免 Recall 虛高問題。
-           方法改為 _eq（等權重）vs _istd（inverse-std 加權），各自有完整四指標。
+  [修正 3] 加回 hard voting（兩種 tie-break 規則並列）
+           Ev3 原本完全移除 hard voting；本版補回，提供完整的方法比較：
+             *_hard_or  : ≥1 票判 anomaly（任何一個 OCC 偵測到就視為異常）
+                          → recall 高，precision 容易偏低
+             *_hard_and : ≥2 票判 anomaly（兩個 OCC 都同意才視為異常）
+                          → precision 高，recall 容易偏低
+           兩個 variant 共用同一個連續 vote count（0/1/2）作為 AUC ranking 分數，
+           因此 *_hard_or 和 *_hard_and 的 AUC 會相同；F1/Recall/G-mean 不同。
 
 核心概念：同一個 OCC 方法（OCSVM / LOF / iForest）分別跑在三種特徵空間上：
   OCC1 = OCC on OF_maj           （對應 Baseline A）
   OCC2 = OCC on DF_maj           （對應 Baseline B）
   OCC3 = OCC on OF_maj + DF_maj  （對應 Baseline C）
 
-三種 pair（每對各有 _eq 和 _istd 兩個 method，共 6 組 ensemble）：
+三種 pair（每對各有 4 個 method：eq / istd / hard_or / hard_and，共 12 組 ensemble）：
   Pair_AB = OCC1 ⊕ OCC2
   Pair_AC = OCC1 ⊕ OCC3
   Pair_BC = OCC2 ⊕ OCC3
 
-Weighted soft voting 流程：
+Weighted soft voting 流程（_eq / _istd 共用）：
   1. 各 OCC 的 anomaly score 先用 train-maj min-max normalize → 大致 [0,1]
      （不使用 test set 統計，避免 data leak）
   2. 計算權重：
@@ -45,6 +48,15 @@ Weighted soft voting 流程：
   4. Threshold = train-maj s_pair 的第 90 百分位數（與 A/B/C 一致）
   5. y_pred   = (s_pair_tst >= threshold).astype(int)
   6. AUC 用連續 s_pair_tst；F1 / Recall / G-mean 用 y_pred（各 variant 各自計算）
+
+Hard voting 流程（_hard_or / _hard_and 共用）：
+  1. 各 OCC 用自己的 train-maj 第 90 百分位數獨立轉成 0/1（即 baseline A/B/C 的 y_pred）
+  2. vote_count = y_i + y_j ∈ {0, 1, 2}
+  3. _hard_or  → y_pred = (vote_count >= 1)  # OR：任一票
+     _hard_and → y_pred = (vote_count >= 2)  # AND：全票
+  4. AUC 用 vote_count（0~2）當連續 ranking 分數
+     → _hard_or 和 _hard_and 的 AUC 必然相同（同一連續分數）
+     → F1 / Recall / G-mean 因二元預測不同而有差異
 
 每筆 ensemble 記錄同時附帶 A / B / C 三條 baseline 在同一
 (AE, config, fold, OCC) 下的結果，方便直接在 xlsx 對比。
@@ -122,12 +134,15 @@ ALL_CONFIGS = [f"h{nl}-{rl}" for nl in N_LAYERS_LIST for rl in BOTTLENECK_RATIOS
 
 EPS = 1e-12  # 防止 inverse-std 除 0
 
-# Methods：先 baseline reference，再 6 組 pair ensemble（3 pair × 2 weight scheme）
+# Methods：先 baseline reference，再 12 組 pair ensemble（3 pair × 4 voting scheme）
 METHODS = [
     "A", "B", "C",
-    "Pair_AB_eq",  "Pair_AB_istd",
-    "Pair_AC_eq",  "Pair_AC_istd",
-    "Pair_BC_eq",  "Pair_BC_istd",
+    "Pair_AB_eq",      "Pair_AB_istd",
+    "Pair_AB_hard_or", "Pair_AB_hard_and",
+    "Pair_AC_eq",      "Pair_AC_istd",
+    "Pair_AC_hard_or", "Pair_AC_hard_and",
+    "Pair_BC_eq",      "Pair_BC_istd",
+    "Pair_BC_hard_or", "Pair_BC_hard_and",
 ]
 
 # 三對的組成：(pair_name, idx_i, idx_j)
@@ -329,6 +344,45 @@ def weighted_pair(s_i_maj_n, s_i_tst_n, s_j_maj_n, s_j_tst_n,
     return metrics_from(y_test, y_pred, s_pair_tst)
 
 
+# ─────────────────────────── Hard pair voting 核心 ───────────────────────────
+def hard_pair(y_i_pred, y_j_pred, y_test, rule):
+    """
+    對一對已產生 binary prediction 的 OCC 結果做 hard voting。
+
+    參數：
+      y_i_pred, y_j_pred : 各 OCC 在 test 上的二元預測（用各自 train-maj
+                           90th percentile 作為閾值產生，與 baseline A/B/C 一致）
+      y_test             : 真實標籤
+      rule               : "or" → ≥1 票判 anomaly；"and" → ≥2 票判 anomaly
+
+    流程：
+      1. vote_count = y_i + y_j ∈ {0, 1, 2}
+      2. _or  → y_pred = (vote_count >= 1)  ← 任一 OCC 偵測到就視為異常（recall 高）
+         _and → y_pred = (vote_count >= 2)  ← 兩 OCC 都同意才視為異常（precision 高）
+      3. AUC 用 vote_count（連續 0/1/2）作為 ranking 分數
+         → "or" 與 "and" 的 AUC 必然相同（同一 ranking）
+         → F1 / Recall / G-mean 因二元預測不同而不同
+
+    注意：
+      Ev3 docstring 提及「OR 嚴重 over-predict」，這是事實 — _hard_or 通常
+      Recall 偏高、Precision 偏低，F1 不一定好；_hard_and 則相反。兩者並列
+      可呈現完整 trade-off，由實驗結果評估哪種對特定資料集較合適。
+
+    回傳 metrics dict。
+    """
+    vote_count = y_i_pred.astype(int) + y_j_pred.astype(int)  # 0 / 1 / 2
+
+    if rule == "or":
+        y_pred = (vote_count >= 1).astype(int)
+    elif rule == "and":
+        y_pred = (vote_count >= 2).astype(int)
+    else:
+        raise ValueError(f"未知的 rule: {rule}")
+
+    # AUC 用 vote_count 當連續分數（與 D 的 Vote3_hard 一致）
+    return metrics_from(y_test, y_pred, vote_count.astype(float))
+
+
 # ─────────────────────────── KEEL .dat 解析 ──────────────────────────────────
 def parse_keel_dat(filepath):
     lines = Path(filepath).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -464,11 +518,14 @@ def run_experiment():
                                 s_raw.append((sm, st))
 
                             # ── Baseline A / B / C（單一 representation）─────
+                            # 保留各 baseline 的 binary y_pred 供後續 hard voting 使用
                             baseline_metrics = {}
+                            baseline_ypred   = {}   # tag → y_pred (np.ndarray)
                             for tag, (sm, st) in zip(["A", "B", "C"], s_raw):
                                 t      = np.percentile(sm, 90)
                                 y_pred = (st >= t).astype(int)
                                 baseline_metrics[tag] = metrics_from(y_tst, y_pred, st)
+                                baseline_ypred[tag]   = y_pred
 
                             # ── Normalize（train-maj min-max，無 data leak）────
                             s_norm = []   # [(sm_n, st_n), ...]
@@ -476,17 +533,28 @@ def run_experiment():
                                 sm_n, st_n = normalize_by_majority(sm, st)
                                 s_norm.append((sm_n, st_n))
 
-                            # ── 6 組 pair ensemble ─────────────────────────────
+                            # ── 12 組 pair ensemble（3 pair × 4 scheme）────────
+                            # 4 schemes: eq / istd（soft）+ hard_or / hard_and（hard）
                             pair_metrics = {}
+                            tag_map = {0: "A", 1: "B", 2: "C"}   # idx → baseline tag
                             for pair_name, idx_i, idx_j in PAIRS:
                                 sm_i_n, st_i_n = s_norm[idx_i]
                                 sm_j_n, st_j_n = s_norm[idx_j]
+                                # Soft：等權重 + inverse-std 加權
                                 for scheme in ("eq", "istd"):
                                     key = f"Pair_{pair_name}_{scheme}"
                                     pair_metrics[key] = weighted_pair(
                                         sm_i_n, st_i_n,
                                         sm_j_n, st_j_n,
                                         y_tst, scheme)
+                                # Hard：or（≥1 票）+ and（≥2 票）
+                                # 使用 baseline 算好的 binary y_pred（與 baseline 同閾值）
+                                y_i_pred = baseline_ypred[tag_map[idx_i]]
+                                y_j_pred = baseline_ypred[tag_map[idx_j]]
+                                for rule in ("or", "and"):
+                                    key = f"Pair_{pair_name}_hard_{rule}"
+                                    pair_metrics[key] = hard_pair(
+                                        y_i_pred, y_j_pred, y_tst, rule)
 
                             method_metrics = {**baseline_metrics, **pair_metrics}
 
@@ -552,17 +620,25 @@ AE_FILL = {
     "SAE": PatternFill("solid", fgColor="FFF2CC"),
     "VAE": PatternFill("solid", fgColor="FCE4D6"),
 }
-# Baseline reference 用淡色；三對 pair 各一色系，_eq 淡色 / _istd 深色
+# Baseline reference 用淡色；三對 pair 各一色系：
+#   _eq        淡色，_istd   深色（soft 雙胞胎）
+#   _hard_or   暖色，_hard_and 暖色加深（hard 雙胞胎）
 METHOD_FILL = {
-    "A":             PatternFill("solid", fgColor="F8CBAD"),
-    "B":             PatternFill("solid", fgColor="C6E0B4"),
-    "C":             PatternFill("solid", fgColor="BDD7EE"),
-    "Pair_AB_eq":    PatternFill("solid", fgColor="FFE699"),
-    "Pair_AB_istd":  PatternFill("solid", fgColor="FFD966"),
-    "Pair_AC_eq":    PatternFill("solid", fgColor="B4C7E7"),
-    "Pair_AC_istd":  PatternFill("solid", fgColor="8FAADC"),
-    "Pair_BC_eq":    PatternFill("solid", fgColor="D9D2E9"),
-    "Pair_BC_istd":  PatternFill("solid", fgColor="B4A7D6"),
+    "A":                  PatternFill("solid", fgColor="F8CBAD"),
+    "B":                  PatternFill("solid", fgColor="C6E0B4"),
+    "C":                  PatternFill("solid", fgColor="BDD7EE"),
+    "Pair_AB_eq":         PatternFill("solid", fgColor="FFE699"),
+    "Pair_AB_istd":       PatternFill("solid", fgColor="FFD966"),
+    "Pair_AB_hard_or":    PatternFill("solid", fgColor="F4B084"),
+    "Pair_AB_hard_and":   PatternFill("solid", fgColor="ED7D31"),
+    "Pair_AC_eq":         PatternFill("solid", fgColor="B4C7E7"),
+    "Pair_AC_istd":       PatternFill("solid", fgColor="8FAADC"),
+    "Pair_AC_hard_or":    PatternFill("solid", fgColor="9DC3E6"),
+    "Pair_AC_hard_and":   PatternFill("solid", fgColor="2E75B6"),
+    "Pair_BC_eq":         PatternFill("solid", fgColor="D9D2E9"),
+    "Pair_BC_istd":       PatternFill("solid", fgColor="B4A7D6"),
+    "Pair_BC_hard_or":    PatternFill("solid", fgColor="C5B4E3"),
+    "Pair_BC_hard_and":   PatternFill("solid", fgColor="7030A0"),
 }
 
 HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
@@ -863,9 +939,13 @@ if __name__ == "__main__":
     print("Pairs   ：AB = (OCC1/OF, OCC2/DF)")
     print("          AC = (OCC1/OF, OCC3/OF+DF)")
     print("          BC = (OCC2/DF, OCC3/OF+DF)")
-    print("Weights ：_eq   = equal weights (0.5, 0.5)")
-    print("          _istd = inverse-std weights (w ∝ 1/std of train-maj norm scores)")
-    print("Threshold：train-maj weighted scores 的第 90 百分位（與 A/B/C 一致）")
+    print("Schemes ：_eq        = equal weights soft voting (0.5, 0.5)")
+    print("          _istd      = inverse-std weighted soft voting (w ∝ 1/std)")
+    print("          _hard_or   = binary OR  voting (≥1 vote → anomaly, recall ↑)")
+    print("          _hard_and  = binary AND voting (≥2 votes → anomaly, precision ↑)")
+    print("Threshold：")
+    print("  Soft → train-maj weighted scores 的第 90 百分位（與 A/B/C 一致）")
+    print("  Hard → 各 OCC 各自用 train-maj 90 percentile 切，再 OR/AND 合併")
     print("選擇準則：AUC 最高")
     print("分頁：all_per_fold / all_summary / all_overall")
     print("      best_per_fold / best_summary / best_overall")

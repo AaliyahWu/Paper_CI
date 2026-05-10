@@ -9,11 +9,16 @@ Ensemble 方法一：OCC1 + OCC2 + OCC3 by voting（對應投影片 "a. OCC1+2+3
   OCC3 = OCC on OF_maj + DF_maj  （對應 Baseline C）
 然後對三個 OCC 的輸出做 ensemble。
 
-本檔案記錄兩種 voting 策略：
-  1) Vote3_hard  ─ majority hard voting（≥ 2/3 投票為 anomaly）
-                   AUC 用 vote count (0–3) 當 ranking score
-  2) Vote3_soft  ─ soft voting：各 OCC 的 anomaly score 經 train-maj min-max
-                   normalize 後平均，threshold 同樣用 train-maj 第 90 百分位數
+本檔案記錄三種 voting 策略：
+  1) Vote3_hard      ─ majority hard voting（≥ 2/3 投票為 anomaly）
+                       AUC 用 vote count (0–3) 當 ranking score
+  2) Vote3_soft      ─ equal-weight soft voting：各 OCC 的 anomaly score 經
+                       train-maj min-max normalize 後等權平均（w=1/3 each），
+                       threshold 用 train-maj 第 90 百分位數
+  3) Vote3_soft_istd ─ inverse-std weighted soft voting：權重 w_i ∝ 1/std(s_i_norm)，
+                       std 越小代表訓練集分數越穩定 → 該 OCC 給予更高信任度。
+                       w_i = (1/std_i) / Σ(1/std_j)，確保 Σw_i = 1。
+                       與 E_ensemble_pairs_grid.py 的 *_istd 邏輯完全一致。
 
 為了方便比較，每筆 ensemble 記錄同時附帶 A / B / C 三條 baseline 在同一
 (AE, config, fold, OCC) 下的結果（Method = "A" / "B" / "C"），可直接在同一
@@ -99,7 +104,10 @@ BOTTLENECK_RATIOS = {
 ALL_CONFIGS = [f"h{nl}-{rl}" for nl in N_LAYERS_LIST for rl in BOTTLENECK_RATIOS]
 
 # 本檔產出的 method 清單（順序決定 Excel 排列）
-METHODS = ["A", "B", "C", "Vote3_hard", "Vote3_soft"]
+METHODS = ["A", "B", "C", "Vote3_hard", "Vote3_soft", "Vote3_soft_istd"]
+
+# 防止 inverse-std 除 0
+EPS = 1e-12
 
 
 # ─────────────────────────── AE 模型定義 ─────────────────────────────────────
@@ -431,8 +439,9 @@ def run_experiment():
                             y_hard = (vote_cnt_tst >= 2).astype(int)
                             m_hard = metrics_from(y_tst, y_hard, vote_cnt_tst)
 
-                            # ─── Ensemble: Soft voting ─────────────────────
-                            # 各 OCC scores 用 train-maj min-max normalize 後平均
+                            # ─── Ensemble: Soft voting (equal weight) ───────
+                            # 各 OCC scores 用 train-maj min-max normalize 後等權平均
+                            # （此版本即原本的 Vote3_soft，w=1/3 each）
                             s1_mn, s1_tn = normalize_by_majority(s1_maj, s1_tst)
                             s2_mn, s2_tn = normalize_by_majority(s2_maj, s2_tst)
                             s3_mn, s3_tn = normalize_by_majority(s3_maj, s3_tst)
@@ -442,12 +451,29 @@ def run_experiment():
                             y_soft = (s_soft_tst >= t_soft).astype(int)
                             m_soft = metrics_from(y_tst, y_soft, s_soft_tst)
 
+                            # ─── Ensemble: Weighted soft voting (inverse-std) ─
+                            # 權重 w_i ∝ 1/std(s_i_train_maj_normalized)，再歸一化
+                            # 使 Σw_i = 1。代表「訓練集分數越穩定 → 權重越高」。
+                            # 與 E_ensemble_pairs_grid.py 的 *_istd 邏輯完全一致。
+                            std1 = float(np.std(s1_mn)) + EPS
+                            std2 = float(np.std(s2_mn)) + EPS
+                            std3 = float(np.std(s3_mn)) + EPS
+                            inv1, inv2, inv3 = 1.0/std1, 1.0/std2, 1.0/std3
+                            total_inv = inv1 + inv2 + inv3
+                            w1, w2, w3 = inv1/total_inv, inv2/total_inv, inv3/total_inv
+                            s_istd_maj = w1*s1_mn + w2*s2_mn + w3*s3_mn
+                            s_istd_tst = w1*s1_tn + w2*s2_tn + w3*s3_tn
+                            t_istd = np.percentile(s_istd_maj, 90)
+                            y_istd = (s_istd_tst >= t_istd).astype(int)
+                            m_soft_istd = metrics_from(y_tst, y_istd, s_istd_tst)
+
                             method_metrics = {
-                                "A":          m_A,
-                                "B":          m_B,
-                                "C":          m_C,
-                                "Vote3_hard": m_hard,
-                                "Vote3_soft": m_soft,
+                                "A":               m_A,
+                                "B":               m_B,
+                                "C":               m_C,
+                                "Vote3_hard":      m_hard,
+                                "Vote3_soft":      m_soft,
+                                "Vote3_soft_istd": m_soft_istd,
                             }
 
                         except Exception as e:
@@ -477,13 +503,13 @@ def run_experiment():
                     ])
                     if sub.empty:
                         continue
-                    for method in ["Vote3_hard", "Vote3_soft"]:
+                    for method in ["Vote3_hard", "Vote3_soft", "Vote3_soft_istd"]:
                         sub_m = sub[sub["Method"] == method].dropna(subset=["AUC"])
                         if sub_m.empty:
                             continue
                         best = sub_m.loc[sub_m["AUC"].idxmax()]
                         print(
-                            f"  {ae_type:4s}×{occ_type:8s} [{method:10s}] "
+                            f"  {ae_type:4s}×{occ_type:8s} [{method:15s}] "
                             f"best={best['Config']:10s} Fold{fold}  "
                             f"AUC={best['AUC']:.4f}  F1={best['F1']:.4f}  "
                             f"Recall={best['Recall']:.4f}  G-mean={best['G-mean']:.4f}"
@@ -516,11 +542,12 @@ AE_FILL = {
     "VAE": PatternFill("solid", fgColor="FCE4D6"),
 }
 METHOD_FILL = {
-    "A":          PatternFill("solid", fgColor="F8CBAD"),
-    "B":          PatternFill("solid", fgColor="C6E0B4"),
-    "C":          PatternFill("solid", fgColor="BDD7EE"),
-    "Vote3_hard": PatternFill("solid", fgColor="FFE699"),
-    "Vote3_soft": PatternFill("solid", fgColor="FFD966"),
+    "A":               PatternFill("solid", fgColor="F8CBAD"),
+    "B":               PatternFill("solid", fgColor="C6E0B4"),
+    "C":               PatternFill("solid", fgColor="BDD7EE"),
+    "Vote3_hard":      PatternFill("solid", fgColor="FFE699"),
+    "Vote3_soft":      PatternFill("solid", fgColor="FFD966"),
+    "Vote3_soft_istd": PatternFill("solid", fgColor="F4B084"),
 }
 
 HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
@@ -847,8 +874,9 @@ if __name__ == "__main__":
     print(f"搜尋空間：n_layers={N_LAYERS_LIST} × bottleneck={list(BOTTLENECK_RATIOS.keys())}")
     print(f"          共 {len(N_LAYERS_LIST) * len(BOTTLENECK_RATIOS)} 種組合 per (AE, OCC, fold)")
     print(f"Methods ：{METHODS}")
-    print("Voting  ：Vote3_hard = binary majority voting (≥2/3)")
-    print("          Vote3_soft = normalize + mean score soft voting")
+    print("Voting  ：Vote3_hard       = binary majority voting (≥2/3)")
+    print("          Vote3_soft       = normalize + equal-weight soft voting (w=1/3)")
+    print("          Vote3_soft_istd  = normalize + inverse-std weighted soft voting")
     print("選擇準則：AUC 最高")
     print("分頁：all_per_fold / all_summary / all_overall")
     print("      best_per_fold / best_summary / best_overall")
@@ -861,6 +889,7 @@ if __name__ == "__main__":
     else:
         save_excel(df_all, df_best)
         print("\n── Best Config Overall Mean（all datasets, ensemble methods only）──")
-        ens_only = df_best[df_best["Method"].isin(["Vote3_hard", "Vote3_soft"])]
+        ens_only = df_best[df_best["Method"].isin(
+            ["Vote3_hard", "Vote3_soft", "Vote3_soft_istd"])]
         print(ens_only.groupby(["Method", "AE", "OCC"])[METRIC_COLS]
               .mean().round(4).to_string())
