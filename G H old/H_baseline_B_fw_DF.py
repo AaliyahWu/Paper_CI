@@ -1,53 +1,62 @@
 """
-G_baseline_B_fw_OF.py
+H_baseline_B_fw_DF.py
 =====================
-實驗二 Phase 1：Feature Weighting 應用方式 1 —— OF 端 weighting
+實驗二 Phase 1：Feature Weighting 應用方式 2 —— DF 端 weighting（修正版）
 
-Pipeline:
-    OF  ──MinMaxScaler──>  OF_s  ──Feature Weighting──>  OF_s_weighted
-        ──VAE 訓練/提取──>  DF (μ)  ──MinMaxScaler──>  ──OCC──>  prediction
+Pipeline（修正後）:
+    OF  ──MinMax──>  OF_s
+        ──DAE 訓練/提取──>  DF
+        ──MinMax──>  DF_s ∈ [0,1]
+        ──Feature Weighting (max=1)──>  DF_w ∈ [0,1]
+        ──OCC (do_scale=False)──>  prediction
+
+修正前版本的 bug：
+    舊版的順序是「DF → FW → run_occ_eval(內部 MinMax) → OCC」。
+    由於 MinMaxScaler 是 per-feature 的 affine transform：
+        MinMax(w_k · x_k) = MinMax(x_k)    ∀ k
+    任何 per-feature weighting 在後續 MinMax 之後完全被 cancel，
+    導致 H 中所有 FW 結果與 FW=none 數值上完全相同（差異 < 1e-15），
+    weighting 效應為零。實測已證實此 bug。
+
+修正方式（三處）：
+    1. 把 weighting 移到 OCC 前的 MinMax 之後 → MinMax 不再 cancel
+       新函式 apply_weights_to_scaled_df 接收已 scaled 的 DF
+    2. run_occ_eval 加 do_scale 參數，FW 流程用 do_scale=False
+       → 跳過第二次 MinMax，weighting 真正影響 OCC 距離計算
+    3. normalize_weights 從 mean=1 改為 max=1
+       → weighted DF 仍在 [0,1]，OCC 看到的 scale 範圍正常
 
 對照 B_baseline_grid_final.py 的差異：
-  1. AE 固定為 VAE（baseline B 中 VAE 在所有 OCC 上都最強：
-       LOF 0.6853 / OCSVM 0.6610 / iForest 0.6522，皆優於 DAE）
-  2. 在 MinMax 後、AE 訓練前，對 OF_s 套用 feature weighting
+  1. AE 固定為 DAE（按 Phase 1 規劃，先收斂變數）
+  2. 在 AE 提取 DF 之後、OCC 之前對 DF 套用 feature weighting
   3. 新增 FW 維度，取代 AE 在輸出表格的位置
-  4. 共 5 種 weighting（含 "none" 作為內部 baseline，應等於 B baseline 的 VAE 結果）
+  4. 共 5 種 weighting（含 "none" 作為內部 baseline）
 
-Feature Weighting 方法（全部只在 train_maj 上計算，無 leakage）：
-  • none : w_j = 1 全部相等（baseline，sanity check）
-  • var  : w_j ∝ Var(x_j)                     變異大 → 鑑別力強
-  • ivar : w_j ∝ 1 / Var(x_j)                 變異小 → majority 穩定標識
-  • mad  : w_j ∝ median|x_j - median(x_j)|    對 outlier robust 的離散度
-  • lap  : w_j ∝ 1 / LaplacianScore(x_j)      保留 local structure 的能力
+與 G_baseline_B_fw_OF.py 的關鍵差異：
+  • G: 在 MinMax 後、DAE 訓練前做 weighting → DAE 看到的是「加權的 OF」
+       → 每個 FW 都要重新訓練全部 21 configs 的 DAE（計算量大）
+  • H: DAE 訓練完成後，在 DF 上做 weighting → DAE 不受 FW 影響
+       → 每個 config 的 DAE 只訓練一次，FW 只是 elementwise 乘法（計算量小）
+
+Feature Weighting 方法（全部只在 train_maj_DF_scaled 上計算，無 leakage）：
+  • none : w_k = 1 全部相等（baseline，sanity check）
+  • var  : w_k ∝ Var(z_k)                     變異大 → 鑑別力強
+  • ivar : w_k ∝ 1 / Var(z_k)                 變異小 → majority 穩定標識
+  • mad  : w_k ∝ median|z_k - median(z_k)|    對 outlier robust
+  • lap  : w_k ∝ 1 / LaplacianScore(z_k)      保留 local structure
 
 權重歸一化：max(w) = 1。
-  保證 weighted OF ∈ [0, OF_s_original] ⊆ [0, 1]，
-  VAE 的 sigmoid decoder 輸出假設不被破壞。
+  保證 weighted DF ∈ [0, DF_s_original] ⊆ [0, 1]，
+  最重要的 feature 保留 100%，其他 < 100% 是衰減。
 
-搜尋空間（與 B/C/D/E/F 對齊，但 OCC 簡化為 LOF only）：
-  AE        : 固定 VAE
-  FW 方法   : none / var / ivar / mad / lap     ── 新增維度
-  OCC       : LOF                                ── A~F 全部最佳組合都在 LOF
-  n_layers  : [1, 2, 3]
-  bottleneck: ["1/4", "1/3", "1/2", "1/1", "2/1", "3/1", "4/1"]
-  → 5 FW × 1 OCC × 21 configs = 105 種組合 per (fold)
+搜尋空間：5 FW × 3 OCC × 21 configs = 315 種組合 per (fold)
+DAE 訓練數：21 configs × 5 folds = 105 次 per dataset（與 B 相同，比 G 便宜 5 倍）
 
-VAE 注意事項：
-  • DF 取 encoder 的 μ（mean vector），而非 reparameterized z
-    （與 B 一致；μ 是確定性的，z 是隨機 sample）
-  • Loss = MSE(x_recon, x) + VAE_BETA × KL(N(μ, σ²) ‖ N(0, I))
-  • VAE_BETA = 1.0（β-VAE 退化為標準 VAE）
+輸出：results/H_baseline_B_fw_DF.xlsx
+  分頁結構與 G 相同（all_per_fold / all_summary / all_overall / best_*）
 
-輸出：results/G_baseline_B_fw_OF.xlsx
-  分頁（全部組合）：
-    all_per_fold      所有 105 種組合每 fold 的原始結果
-    all_summary       所有組合 mean ± std（across folds，per dataset）
-    all_overall       所有組合全域平均
-  分頁（最佳組合，per-dataset 選法）：
-    best_per_fold     每 (Dataset, FW, OCC) 中『5-fold 平均 AUC 最高』的 Config
-    best_summary      最佳組合 mean ± std
-    best_overall      最佳組合全域平均 + 最常選中的 Config
+Sanity check 重點：跑完後 H 的 5 個 FW 在 best_overall 上不應該全都一樣，
+若雷同代表修正未生效或有其他 bug。
 """
 
 import re
@@ -77,7 +86,7 @@ np.random.seed(42)
 # ─────────────────────────── 路徑設定 ────────────────────────────────────────
 DATA_ROOT   = Path("data")
 RESULTS_DIR = Path("results")
-OUTPUT_FILE = RESULTS_DIR / "G_baseline_B_fw_OF.xlsx"
+OUTPUT_FILE = RESULTS_DIR / "H_baseline_B_fw_DF.xlsx"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 N_FOLDS = 5
@@ -87,17 +96,11 @@ EPS     = 1e-12
 AE_EPOCHS     = 100
 AE_BATCH_SIZE = 64
 AE_LR         = 1e-3
-VAE_BETA      = 1.0       # β-VAE 退化為標準 VAE（與 B 一致）
+DAE_NOISE     = 0.1
 
-# ── Phase 1：固定 VAE（B 中 VAE 在所有 OCC 上都最強）──
-AE_TYPE     = "VAE"
-
-# ── Phase 1 簡化：只跑 LOF（A~F 全部最佳組合都在 LOF）──
-# 理由：A=LOF 0.6292、B=LOF+VAE 0.6853、C=LOF+VAE 0.6742、D=LOF+VAE 0.6764、
-#       E=LOF+VAE 0.6861、F=LOF+(AE+VAE) 0.6897，LOF 在每個方案上都壓倒 OCSVM/iForest
-# 若之後要 OCC ablation 再切回三 OCC：取消下面註解即可。
-# OCC_TYPES = ["OCSVM", "LOF", "iForest"]
-OCC_TYPES   = ["LOF"]
+# ── Phase 1：固定 DAE ──
+AE_TYPE     = "DAE"
+OCC_TYPES   = ["OCSVM", "LOF", "iForest"]
 METRIC_COLS = ["AUC", "F1", "Recall", "G-mean"]
 
 # ── Feature Weighting 方法（含 "none" 內部 baseline）──
@@ -117,15 +120,17 @@ ALL_CONFIGS = [f"h{nl}-{rl}" for nl in N_LAYERS_LIST for rl in BOTTLENECK_RATIOS
 def compute_feature_weights(X, method, k=LAPLACIAN_K, eps=EPS):
     """
     在 train majority 上計算每個特徵的權重（非負）。
+    與 G_baseline_B_fw_OF.py 的計算公式完全一致 — 兩個檔案差異只在「對誰計算」。
+    這裡的 X 是 train_maj 的 DF（AE 提取的深度特徵）。
 
     參數：
-      X      : (n, d) array，已 MinMax-scaled 的 train majority
+      X      : (n_maj, d_df) array，DAE 提取的 train majority DF
       method : "none" | "var" | "ivar" | "mad" | "lap"
       k      : Laplacian Score 用的 KNN 鄰居數
       eps    : 數值穩定保護
 
     返回：
-      w : (d,) array，非負原始權重（尚未歸一化）
+      w : (d_df,) array，非負原始權重（尚未歸一化）
     """
     n, d = X.shape
 
@@ -133,27 +138,21 @@ def compute_feature_weights(X, method, k=LAPLACIAN_K, eps=EPS):
         return np.ones(d, dtype=float)
 
     elif method == "var":
-        # 變異越大 → 權重越大
         return np.clip(X.var(axis=0), 0, None)
 
     elif method == "ivar":
-        # 變異越小 → 權重越大（majority 內穩定 = anomaly 標識）
         return 1.0 / (X.var(axis=0) + eps)
 
     elif method == "mad":
-        # Median Absolute Deviation：對 outlier robust
         med = np.median(X, axis=0)
         return np.clip(np.median(np.abs(X - med), axis=0), 0, None)
 
     elif method == "lap":
         # Laplacian Score (He et al., NIPS 2005)
-        # 分數越小 → 越能保留 local structure → 越重要
-        # 權重取倒數：w_j ∝ 1 / LS_j
         if n < 3:
             return np.ones(d, dtype=float)
 
         k_eff = max(1, min(k, n - 1))
-        # 取鄰近距離當 graph weight 的基底（heat kernel）
         try:
             S = kneighbors_graph(
                 X, n_neighbors=k_eff, mode="distance",
@@ -162,11 +161,9 @@ def compute_feature_weights(X, method, k=LAPLACIAN_K, eps=EPS):
         except Exception:
             return np.ones(d, dtype=float)
 
-        # heat kernel: S_ij = exp(-||x_i - x_j||^2 / t)，t 用 median 距離平方
         pos = S[S > 0]
         t = (np.median(pos) ** 2 + eps) if len(pos) > 0 else 1.0
         S = np.where(S > 0, np.exp(-(S ** 2) / t), 0.0)
-        # 對稱化（KNN graph 不對稱）
         S = 0.5 * (S + S.T)
 
         D_diag = S.sum(axis=1)
@@ -196,12 +193,10 @@ def normalize_weights(w):
     物理意義：最重要的 feature 保留 100%，其他 < 100% 是衰減。
 
     為什麼用 max=1 而非 mean=1：
-      1. 保證 weighted X ∈ [0, X_original] ⊆ [0, 1]
-         → VAE 的 sigmoid decoder 輸出假設不被破壞
-         → 高權重 dim 不會因為 weighted > 1 而被 sigmoid 永遠重建不出來
+      1. 保證 weighted DF ∈ [0, DF_s_original] ⊆ [0, 1]
+         → OCC 看到的 scale 範圍維持正常
       2. mean=1 歸一化在 ivar 模式下，遇到 var≈0 的 dim 會讓
-         該 dim weight 爆增、其他 dim 趨近 0；max=1 不會（最大固定 1，
-         其他相對縮放）
+         該 dim weight 爆增、其他 dim 趨近 0；max=1 不會
       3. 純 linear scaling，可逆，保留所有 dim 的相對比例
     """
     w = np.asarray(w, dtype=float)
@@ -212,70 +207,50 @@ def normalize_weights(w):
     return w / m
 
 
-def apply_weights(X_maj_s, X_tst_s, method):
+def apply_weights_to_scaled_df(DF_maj_s, DF_tst_s, method):
+    """在【已 MinMax-scaled】的 DF 上計算 weights 並套用。
+
+    為什麼一定要在 scaled DF 上做（而非原始 DF）？
+      因為若先在 raw DF 上 weight、再進 OCC 前的 MinMax，
+      MinMax 是 per-feature affine transform，會完全 cancel weighting：
+          MinMax(w_k * x_k) = MinMax(x_k)   ∀ k
+      導致 FW 效應為零（已實測證實）。
+      改成「先 MinMax → 再 weighting → 不再 scale 進 OCC」
+      才能讓 weighting 真正影響 OCC 的距離計算。
+
+    Weights 只用 train_maj_scaled_DF 計算 → 無 data leakage。
+    返回 weighted train + test，以及實際使用的 weights。
     """
-    在 OF（已 MinMax-scaled）上計算 weights 並套用至 train + test。
-    weights 只用 train_maj 計算，test 沿用 → 無 data leakage。
-    """
-    w_raw  = compute_feature_weights(X_maj_s, method)
-    w_norm = normalize_weights(w_raw)
-    return X_maj_s * w_norm, X_tst_s * w_norm, w_norm
+    w_raw  = compute_feature_weights(DF_maj_s, method)
+    w_norm = normalize_weights(w_raw)            # max=1
+    return DF_maj_s * w_norm, DF_tst_s * w_norm, w_norm
 
 
-# ─────────────────────────── AE 模型（VAE）─────────────────────────────────
-class VAEModel(nn.Module):
-    """VAE 架構（與 B_baseline_grid_final.py 的 VAEModel 完全一致）。
-
-    結構說明：
-      encoder 分兩段：
-        enc_base : 中間隱藏層，dim = [input_dim, n_units, ..., n_units]
-                   最後一層之前用 ReLU；若只有 1 layer 則為 Identity
-        fc_mu    : 從 enc_base 的輸出投影到 μ ∈ R^{n_units}
-        fc_logvar: 從 enc_base 的輸出投影到 log σ² ∈ R^{n_units}
-      reparameterize: z = μ + exp(0.5·logvar) · ε,  ε ~ N(0, I)
-      decoder  : 對稱結構，最後一層 sigmoid 將輸出壓回 [0, 1]
-
-    DF 提取：使用 μ（確定性，與 B 一致），不使用隨機 sample 的 z。
-    """
+# ─────────────────────────── AE 模型（DAE）─────────────────────────────────
+class AEModel(nn.Module):
+    """DAE 共用架構（與 B_baseline_grid_final.py 完全一致）。"""
     def __init__(self, input_dim, n_layers, n_units):
         super().__init__()
         dims = [input_dim] + [n_units] * n_layers
-        # encoder base：除最後一層之外的所有隱藏層
-        base = []
-        for i in range(len(dims) - 2):
-            base += [nn.Linear(dims[i], dims[i+1]), nn.ReLU()]
-        self.enc_base  = nn.Sequential(*base) if base else nn.Identity()
-        # 將 enc_base 輸出投影成 μ 與 logvar
-        mid = dims[-2] if len(dims) >= 2 else input_dim
-        self.fc_mu     = nn.Linear(mid, dims[-1])
-        self.fc_logvar = nn.Linear(mid, dims[-1])
-        # decoder：對稱反向
-        dec_dims = dims[::-1]
-        dec = []
-        for i in range(len(dec_dims) - 1):
-            act = nn.Sigmoid() if i == len(dec_dims) - 2 else nn.ReLU()
-            dec += [nn.Linear(dec_dims[i], dec_dims[i+1]), act]
+        enc, dec = [], []
+        for i in range(len(dims) - 1):
+            enc += [nn.Linear(dims[i], dims[i+1]), nn.ReLU()]
+        for i in range(len(dims) - 1):
+            d_in, d_out = dims[-(i+1)], dims[-(i+2)]
+            act = nn.Sigmoid() if i == len(dims) - 2 else nn.ReLU()
+            dec += [nn.Linear(d_in, d_out), act]
+        self.encoder = nn.Sequential(*enc)
         self.decoder = nn.Sequential(*dec)
 
-    def reparameterize(self, mu, lv):
-        return mu + torch.exp(0.5 * lv) * torch.randn_like(lv)
-
     def forward(self, x):
-        h  = self.enc_base(x)
-        mu = self.fc_mu(h)
-        lv = self.fc_logvar(h)
-        z  = self.reparameterize(mu, lv)
-        return self.decoder(z), z, mu, lv
+        z = self.encoder(x)
+        return self.decoder(z), z
 
 
-def train_and_extract_vae(X_maj_s, X_test_s, n_layers, n_units):
-    """訓練 VAE 並提取深度特徵（與 B 的 train_and_extract 在 VAE 分支完全一致）。
-
-    Loss = MSE(x_recon, x) + VAE_BETA × KL(N(μ, σ²) ‖ N(0, I))
-    DF 取 encoder 的 μ（確定性、不含隨機 sample 雜訊）。
-    """
+def train_and_extract_dae(X_maj_s, X_test_s, n_layers, n_units):
+    """訓練 DAE 並提取深度特徵（與 B 一致）。"""
     input_dim = X_maj_s.shape[1]
-    model = VAEModel(input_dim, n_layers, n_units)
+    model = AEModel(input_dim, n_layers, n_units)
     optim_ = torch.optim.Adam(model.parameters(), lr=AE_LR)
     mse    = nn.MSELoss()
     bs     = min(AE_BATCH_SIZE, len(X_maj_s))
@@ -288,11 +263,9 @@ def train_and_extract_vae(X_maj_s, X_test_s, n_layers, n_units):
         model.train()
         for (xb,) in loader:
             optim_.zero_grad()
-            # VAE: 重建損失 + KL 散度
-            xr, _, mu, lv = model(xb)
-            recon = mse(xr, xb)
-            kl    = -0.5 * (1 + lv - mu.pow(2) - lv.exp()).mean()
-            loss  = recon + VAE_BETA * kl
+            xb_n = torch.clamp(xb + DAE_NOISE * torch.randn_like(xb), 0, 1)
+            xr, _ = model(xb_n)
+            loss  = mse(xr, xb)
             loss.backward()
             optim_.step()
 
@@ -301,8 +274,8 @@ def train_and_extract_vae(X_maj_s, X_test_s, n_layers, n_units):
     def extract(X):
         xt = torch.tensor(X, dtype=torch.float32)
         with torch.no_grad():
-            _, _, mu, _ = model(xt)
-            return mu.numpy()                # 與 B 一致：DF = μ
+            _, z = model(xt)
+            return z.numpy()
 
     return extract(X_maj_s), extract(X_test_s)
 
@@ -318,10 +291,24 @@ def gmean_score(y_true, y_pred_binary):
     return 0.0
 
 
-def run_occ_eval(occ_type, feat_maj, feat_test, y_test, n_neighbors_cap):
-    scaler      = MinMaxScaler()
-    feat_maj_s  = scaler.fit_transform(feat_maj)
-    feat_test_s = scaler.transform(feat_test)
+def run_occ_eval(occ_type, feat_maj, feat_test, y_test, n_neighbors_cap,
+                 do_scale=True):
+    """OCC 評估。
+
+    do_scale 預設 True，與 B/D/E/F 完全一致（OCC 前做 MinMax）。
+    do_scale=False 用於 H 的修正後 pipeline：input 已經是
+    「MinMax-scaled then weighted」的 DF，再做一次 MinMax 會 cancel
+    掉 weighting（因為 MinMax 是 per-feature affine：
+        MinMax(w_k * x_k) = MinMax(x_k)），
+    所以必須跳過。
+    """
+    if do_scale:
+        scaler      = MinMaxScaler()
+        feat_maj_s  = scaler.fit_transform(feat_maj)
+        feat_test_s = scaler.transform(feat_test)
+    else:
+        feat_maj_s  = feat_maj
+        feat_test_s = feat_test
 
     if occ_type == "OCSVM":
         clf = OneClassSVM(nu=0.1, kernel="rbf")
@@ -395,11 +382,11 @@ def parse_keel_dat(filepath, minority_label=None):
 def run_experiment():
     """
     執行順序：
-      dataset → fold → FW → config → OCC
+      dataset → fold → config → [AE 訓練一次] → FW → OCC
 
-    為什麼 FW 在外、config 在內？
-      因為 FW 改變 AE 的 input → 每個 FW 都要重新訓練全部 21 configs 的 VAE。
-      把 FW 放外層較容易追蹤進度，且 print log 比較清楚。
+    為什麼 FW 在內、config 在外？
+      因為 FW 不影響 AE 的 input → 同一個 config 的 DAE 只訓練一次即可，
+      然後其產生的 DF 被所有 FW × OCC 共用。比 G 省下大量 AE 訓練時間。
     """
     dataset_dirs = sorted([d for d in DATA_ROOT.iterdir() if d.is_dir()])
     if not dataset_dirs:
@@ -446,7 +433,6 @@ def run_experiment():
                     print(f"  [SKIP] Fold {fold}: 測試集無少數類樣本")
                     continue
 
-                # MinMax fit 只用 training majority
                 scaler   = MinMaxScaler()
                 X_maj_s  = scaler.fit_transform(X_maj)
                 X_tst_s  = scaler.transform(X_tst)
@@ -456,42 +442,56 @@ def run_experiment():
                 print(f"  [ERROR] Fold {fold} 資料載入失敗: {e}")
                 continue
 
-            for fw in FW_METHODS:
-                # === Phase 1 核心步驟：在 OF 端套用 weighting ===
+            # 每個 config 的 DAE 只訓練一次（FW 不影響 AE input）
+            for n_layers, ratio_label in param_configs:
+                ratio   = BOTTLENECK_RATIOS[ratio_label]
+                n_units = max(2, round(input_dim * ratio))
+                cfg_label = f"h{n_layers}-{ratio_label}"
+
                 try:
-                    X_maj_w, X_tst_w, w_used = apply_weights(X_maj_s, X_tst_s, fw)
+                    DF_maj, DF_tst = train_and_extract_dae(
+                        X_maj_s, X_tst_s, n_layers, n_units)
                 except Exception as e:
-                    print(f"  [ERROR] FW={fw} Fold{fold} weighting 失敗: {e}")
+                    print(f"  [ERROR] Fold{fold} {cfg_label}: DAE 失敗 {e}")
                     continue
 
-                # 對每個 config 訓練一次 VAE（VAE 看到的是 weighted OF）
-                feat_cache = {}
-                for n_layers, ratio_label in param_configs:
-                    ratio   = BOTTLENECK_RATIOS[ratio_label]
-                    n_units = max(2, round(input_dim * ratio))
-                    try:
-                        feat_maj, feat_tst = train_and_extract_vae(
-                            X_maj_w, X_tst_w, n_layers, n_units)
-                        feat_cache[(n_layers, ratio_label)] = (feat_maj, feat_tst)
-                    except Exception as e:
-                        print(f"  [ERROR] FW={fw} h{n_layers}-{ratio_label} "
-                              f"Fold{fold}: VAE 失敗 {e}")
+                # === H 修正後的 pipeline ===
+                # 1. 先對 DF 做 MinMax → DF_s ∈ [0,1]
+                #    （這步原本在 run_occ_eval 內部，現在提前並只做一次）
+                # 2. 對每個 FW，在 DF_s 上計算 weights 並 apply → DF_w ∈ [0,1]
+                # 3. 送進 run_occ_eval(do_scale=False)，避免再做一次 MinMax
+                #    把 weighting cancel 掉
+                df_scaler = MinMaxScaler()
+                try:
+                    DF_maj_s = df_scaler.fit_transform(DF_maj)
+                    DF_tst_s = df_scaler.transform(DF_tst)
+                except Exception as e:
+                    print(f"  [ERROR] Fold{fold} {cfg_label}: DF MinMax 失敗 {e}")
+                    continue
 
-                # 對每個 OCC × config 計算 metrics
-                for occ_type in OCC_TYPES:
-                    for (n_layers, ratio_label), (feat_maj, feat_tst) in feat_cache.items():
-                        cfg_label = f"h{n_layers}-{ratio_label}"
+                for fw in FW_METHODS:
+                    try:
+                        DF_maj_w, DF_tst_w, w_used = apply_weights_to_scaled_df(
+                            DF_maj_s, DF_tst_s, fw)
+                    except Exception as e:
+                        print(f"  [ERROR] Fold{fold} {cfg_label} FW={fw}: {e}")
+                        continue
+
+                    for occ_type in OCC_TYPES:
                         try:
+                            # do_scale=False：input 已 MinMax-scaled + weighted，
+                            # 不可再 MinMax（會 cancel weighting）
                             metrics = run_occ_eval(
-                                occ_type, feat_maj, feat_tst, y_tst, n_nb_cap)
+                                occ_type, DF_maj_w, DF_tst_w, y_tst, n_nb_cap,
+                                do_scale=False)
                         except Exception as e:
-                            print(f"  [ERROR] FW={fw} {occ_type}({cfg_label}) "
-                                  f"Fold{fold}: {e}")
+                            print(f"  [ERROR] Fold{fold} {cfg_label} FW={fw} "
+                                  f"{occ_type}: {e}")
                             metrics = {m: float("nan") for m in METRIC_COLS}
 
                         all_records.append({
                             "Dataset": ds_name,
-                            "AE":      AE_TYPE,        # 固定 VAE
+                            "AE":      AE_TYPE,
                             "FW":      fw,
                             "OCC":     occ_type,
                             "Config":  cfg_label,
@@ -499,13 +499,12 @@ def run_experiment():
                             **metrics,
                         })
 
-                print(f"  [fold {fold}] FW={fw:5s}  ✓")
+            print(f"  [fold {fold}] 完成 {len(param_configs)} configs × "
+                  f"{len(FW_METHODS)} FW × {len(OCC_TYPES)} OCC")
 
     df_all = pd.DataFrame(all_records)
 
     # ── df_best：per-dataset 選法（與 B/F 一致，避免 per-fold leakage）──
-    # 對每個 (Dataset, FW, OCC)，從 21 個 config 中選 5-fold 平均 AUC 最高者，
-    # 保留該 config 全部 5 fold 紀錄。
     df_clean = df_all.dropna(subset=["AUC"])
     best_cfg = (
         df_clean.groupby(["Dataset", "FW", "OCC", "Config"])["AUC"]
@@ -528,7 +527,7 @@ def run_experiment():
     return df_all, df_best
 
 
-# ─────────────────────────── Excel 樣式 ──────────────────────────────────────
+# ─────────────────────────── Excel 樣式（與 G 共用設計）──────────────────
 HEADER_FILL = PatternFill("solid", fgColor="2F5597")
 SUBHDR_FILL = PatternFill("solid", fgColor="BDD7EE")
 ALT_FILL    = PatternFill("solid", fgColor="F2F2F2")
@@ -721,7 +720,7 @@ def write_overall_all(ws, df):
     total_cols = 3 + len(METRIC_COLS)
     ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
     c = ws["A1"]
-    c.value     = "Overall Mean（all configs, all datasets & folds）- G: OF-side Feature Weighting (VAE)"
+    c.value     = "Overall Mean（all configs, all datasets & folds）- H: DF-side Feature Weighting (DAE)"
     c.font      = Font(name="Arial", bold=True, size=13, color="1F3864")
     c.alignment = CENTER_ALIGN
 
@@ -761,7 +760,7 @@ def write_overall_best(ws, df):
     total_cols = 3 + len(METRIC_COLS)
     ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
     c = ws["A1"]
-    c.value     = "Overall Mean（best config per dataset）- G: OF-side Feature Weighting (VAE)"
+    c.value     = "Overall Mean（best config per dataset）- H: DF-side Feature Weighting (DAE)"
     c.font      = Font(name="Arial", bold=True, size=13, color="1F3864")
     c.alignment = CENTER_ALIGN
 
@@ -819,7 +818,7 @@ def save_excel(df_all, df_best):
 # ─────────────────────────── Entry Point ─────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 68)
-    print("實驗二 / Phase 1：G — OF 端 Feature Weighting × VAE")
+    print("實驗二 / Phase 1：H — DF 端 Feature Weighting × DAE")
     print(f"AE        : 固定 {AE_TYPE}")
     print(f"FW 方法   : {FW_METHODS}（含 none 內部 baseline）")
     print(f"OCC       : {OCC_TYPES}")
@@ -832,7 +831,7 @@ if __name__ == "__main__":
     print("選擇準則  : AUC 最高")
     print("分頁      : all_per_fold / all_summary / all_overall")
     print("            best_per_fold / best_summary / best_overall")
-    print("Pipeline  : OF → MinMax → FW → VAE → DF (μ) → MinMax → OCC")
+    print("Pipeline  : OF → MinMax → DAE → DF → FW → MinMax → OCC")
     print("=" * 68)
 
     df_all, df_best = run_experiment()

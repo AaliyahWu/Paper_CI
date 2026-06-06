@@ -1,11 +1,11 @@
 """
 H_baseline_B_fw_DF.py
 =====================
-實驗二 Phase 1：Feature Weighting 應用方式 2 —— DF 端 weighting（修正版）
+實驗二 Phase 1：Feature Weighting 應用方式 2 —— DF 端 weighting（修正版 + VAE）
 
 Pipeline（修正後）:
     OF  ──MinMax──>  OF_s
-        ──DAE 訓練/提取──>  DF
+        ──VAE 訓練/提取──>  DF (μ)
         ──MinMax──>  DF_s ∈ [0,1]
         ──Feature Weighting (max=1)──>  DF_w ∈ [0,1]
         ──OCC (do_scale=False)──>  prediction
@@ -27,16 +27,17 @@ Pipeline（修正後）:
        → weighted DF 仍在 [0,1]，OCC 看到的 scale 範圍正常
 
 對照 B_baseline_grid_final.py 的差異：
-  1. AE 固定為 DAE（按 Phase 1 規劃，先收斂變數）
+  1. AE 固定為 VAE（baseline B 中 VAE 在所有 OCC 上都最強：
+       LOF 0.6853 / OCSVM 0.6610 / iForest 0.6522，皆優於 DAE）
   2. 在 AE 提取 DF 之後、OCC 之前對 DF 套用 feature weighting
   3. 新增 FW 維度，取代 AE 在輸出表格的位置
   4. 共 5 種 weighting（含 "none" 作為內部 baseline）
 
 與 G_baseline_B_fw_OF.py 的關鍵差異：
-  • G: 在 MinMax 後、DAE 訓練前做 weighting → DAE 看到的是「加權的 OF」
-       → 每個 FW 都要重新訓練全部 21 configs 的 DAE（計算量大）
-  • H: DAE 訓練完成後，在 DF 上做 weighting → DAE 不受 FW 影響
-       → 每個 config 的 DAE 只訓練一次，FW 只是 elementwise 乘法（計算量小）
+  • G: 在 MinMax 後、VAE 訓練前做 weighting → VAE 看到的是「加權的 OF」
+       → 每個 FW 都要重新訓練全部 21 configs 的 VAE（計算量大）
+  • H: VAE 訓練完成後，在 DF 上做 weighting → VAE 不受 FW 影響
+       → 每個 config 的 VAE 只訓練一次，FW 只是 elementwise 乘法（計算量小）
 
 Feature Weighting 方法（全部只在 train_maj_DF_scaled 上計算，無 leakage）：
   • none : w_k = 1 全部相等（baseline，sanity check）
@@ -49,8 +50,14 @@ Feature Weighting 方法（全部只在 train_maj_DF_scaled 上計算，無 leak
   保證 weighted DF ∈ [0, DF_s_original] ⊆ [0, 1]，
   最重要的 feature 保留 100%，其他 < 100% 是衰減。
 
-搜尋空間：5 FW × 3 OCC × 21 configs = 315 種組合 per (fold)
-DAE 訓練數：21 configs × 5 folds = 105 次 per dataset（與 B 相同，比 G 便宜 5 倍）
+搜尋空間：5 FW × 1 OCC × 21 configs = 105 種組合 per (fold)
+  （OCC 簡化為 LOF only —— A~F 全部最佳組合都落在 LOF 上）
+VAE 訓練數：21 configs × 5 folds = 105 次 per dataset（與 B 相同，比 G 便宜 5 倍）
+
+VAE 注意事項：
+  • DF 取 encoder 的 μ（mean vector），而非 reparameterized z（與 B 一致）
+  • Loss = MSE(x_recon, x) + VAE_BETA × KL(N(μ, σ²) ‖ N(0, I))
+  • VAE_BETA = 1.0（β-VAE 退化為標準 VAE）
 
 輸出：results/H_baseline_B_fw_DF.xlsx
   分頁結構與 G 相同（all_per_fold / all_summary / all_overall / best_*）
@@ -96,11 +103,17 @@ EPS     = 1e-12
 AE_EPOCHS     = 100
 AE_BATCH_SIZE = 64
 AE_LR         = 1e-3
-DAE_NOISE     = 0.1
+VAE_BETA      = 1.0       # β-VAE 退化為標準 VAE（與 B 一致）
 
-# ── Phase 1：固定 DAE ──
-AE_TYPE     = "DAE"
-OCC_TYPES   = ["OCSVM", "LOF", "iForest"]
+# ── Phase 1：固定 VAE（B 中 VAE 在所有 OCC 上都最強）──
+AE_TYPE     = "VAE"
+
+# ── Phase 1 簡化：只跑 LOF（A~F 全部最佳組合都在 LOF）──
+# 理由：A=LOF 0.6292、B=LOF+VAE 0.6853、C=LOF+VAE 0.6742、D=LOF+VAE 0.6764、
+#       E=LOF+VAE 0.6861、F=LOF+(AE+VAE) 0.6897，LOF 在每個方案上都壓倒 OCSVM/iForest
+# 若之後要 OCC ablation 再切回三 OCC：取消下面註解即可。
+# OCC_TYPES = ["OCSVM", "LOF", "iForest"]
+OCC_TYPES   = ["LOF"]
 METRIC_COLS = ["AUC", "F1", "Recall", "G-mean"]
 
 # ── Feature Weighting 方法（含 "none" 內部 baseline）──
@@ -124,7 +137,7 @@ def compute_feature_weights(X, method, k=LAPLACIAN_K, eps=EPS):
     這裡的 X 是 train_maj 的 DF（AE 提取的深度特徵）。
 
     參數：
-      X      : (n_maj, d_df) array，DAE 提取的 train majority DF
+      X      : (n_maj, d_df) array，VAE 提取的 train majority DF（μ vector）
       method : "none" | "var" | "ivar" | "mad" | "lap"
       k      : Laplacian Score 用的 KNN 鄰居數
       eps    : 數值穩定保護
@@ -226,31 +239,60 @@ def apply_weights_to_scaled_df(DF_maj_s, DF_tst_s, method):
     return DF_maj_s * w_norm, DF_tst_s * w_norm, w_norm
 
 
-# ─────────────────────────── AE 模型（DAE）─────────────────────────────────
-class AEModel(nn.Module):
-    """DAE 共用架構（與 B_baseline_grid_final.py 完全一致）。"""
+# ─────────────────────────── AE 模型（VAE）─────────────────────────────────
+class VAEModel(nn.Module):
+    """VAE 架構（與 B_baseline_grid_final.py 的 VAEModel 完全一致）。
+
+    結構說明：
+      encoder 分兩段：
+        enc_base : 中間隱藏層，dim = [input_dim, n_units, ..., n_units]
+                   最後一層之前用 ReLU；若只有 1 layer 則為 Identity
+        fc_mu    : 從 enc_base 的輸出投影到 μ ∈ R^{n_units}
+        fc_logvar: 從 enc_base 的輸出投影到 log σ² ∈ R^{n_units}
+      reparameterize: z = μ + exp(0.5·logvar) · ε,  ε ~ N(0, I)
+      decoder  : 對稱結構，最後一層 sigmoid 將輸出壓回 [0, 1]
+
+    DF 提取：使用 μ（確定性，與 B 一致），不使用隨機 sample 的 z。
+    """
     def __init__(self, input_dim, n_layers, n_units):
         super().__init__()
         dims = [input_dim] + [n_units] * n_layers
-        enc, dec = [], []
-        for i in range(len(dims) - 1):
-            enc += [nn.Linear(dims[i], dims[i+1]), nn.ReLU()]
-        for i in range(len(dims) - 1):
-            d_in, d_out = dims[-(i+1)], dims[-(i+2)]
-            act = nn.Sigmoid() if i == len(dims) - 2 else nn.ReLU()
-            dec += [nn.Linear(d_in, d_out), act]
-        self.encoder = nn.Sequential(*enc)
+        # encoder base：除最後一層之外的所有隱藏層
+        base = []
+        for i in range(len(dims) - 2):
+            base += [nn.Linear(dims[i], dims[i+1]), nn.ReLU()]
+        self.enc_base  = nn.Sequential(*base) if base else nn.Identity()
+        # 將 enc_base 輸出投影成 μ 與 logvar
+        mid = dims[-2] if len(dims) >= 2 else input_dim
+        self.fc_mu     = nn.Linear(mid, dims[-1])
+        self.fc_logvar = nn.Linear(mid, dims[-1])
+        # decoder：對稱反向
+        dec_dims = dims[::-1]
+        dec = []
+        for i in range(len(dec_dims) - 1):
+            act = nn.Sigmoid() if i == len(dec_dims) - 2 else nn.ReLU()
+            dec += [nn.Linear(dec_dims[i], dec_dims[i+1]), act]
         self.decoder = nn.Sequential(*dec)
 
+    def reparameterize(self, mu, lv):
+        return mu + torch.exp(0.5 * lv) * torch.randn_like(lv)
+
     def forward(self, x):
-        z = self.encoder(x)
-        return self.decoder(z), z
+        h  = self.enc_base(x)
+        mu = self.fc_mu(h)
+        lv = self.fc_logvar(h)
+        z  = self.reparameterize(mu, lv)
+        return self.decoder(z), z, mu, lv
 
 
-def train_and_extract_dae(X_maj_s, X_test_s, n_layers, n_units):
-    """訓練 DAE 並提取深度特徵（與 B 一致）。"""
+def train_and_extract_vae(X_maj_s, X_test_s, n_layers, n_units):
+    """訓練 VAE 並提取深度特徵（與 B 的 train_and_extract 在 VAE 分支完全一致）。
+
+    Loss = MSE(x_recon, x) + VAE_BETA × KL(N(μ, σ²) ‖ N(0, I))
+    DF 取 encoder 的 μ（確定性、不含隨機 sample 雜訊）。
+    """
     input_dim = X_maj_s.shape[1]
-    model = AEModel(input_dim, n_layers, n_units)
+    model = VAEModel(input_dim, n_layers, n_units)
     optim_ = torch.optim.Adam(model.parameters(), lr=AE_LR)
     mse    = nn.MSELoss()
     bs     = min(AE_BATCH_SIZE, len(X_maj_s))
@@ -263,9 +305,11 @@ def train_and_extract_dae(X_maj_s, X_test_s, n_layers, n_units):
         model.train()
         for (xb,) in loader:
             optim_.zero_grad()
-            xb_n = torch.clamp(xb + DAE_NOISE * torch.randn_like(xb), 0, 1)
-            xr, _ = model(xb_n)
-            loss  = mse(xr, xb)
+            # VAE: 重建損失 + KL 散度
+            xr, _, mu, lv = model(xb)
+            recon = mse(xr, xb)
+            kl    = -0.5 * (1 + lv - mu.pow(2) - lv.exp()).mean()
+            loss  = recon + VAE_BETA * kl
             loss.backward()
             optim_.step()
 
@@ -274,8 +318,8 @@ def train_and_extract_dae(X_maj_s, X_test_s, n_layers, n_units):
     def extract(X):
         xt = torch.tensor(X, dtype=torch.float32)
         with torch.no_grad():
-            _, z = model(xt)
-            return z.numpy()
+            _, _, mu, _ = model(xt)
+            return mu.numpy()                # 與 B 一致：DF = μ
 
     return extract(X_maj_s), extract(X_test_s)
 
@@ -385,7 +429,7 @@ def run_experiment():
       dataset → fold → config → [AE 訓練一次] → FW → OCC
 
     為什麼 FW 在內、config 在外？
-      因為 FW 不影響 AE 的 input → 同一個 config 的 DAE 只訓練一次即可，
+      因為 FW 不影響 AE 的 input → 同一個 config 的 VAE 只訓練一次即可，
       然後其產生的 DF 被所有 FW × OCC 共用。比 G 省下大量 AE 訓練時間。
     """
     dataset_dirs = sorted([d for d in DATA_ROOT.iterdir() if d.is_dir()])
@@ -442,17 +486,17 @@ def run_experiment():
                 print(f"  [ERROR] Fold {fold} 資料載入失敗: {e}")
                 continue
 
-            # 每個 config 的 DAE 只訓練一次（FW 不影響 AE input）
+            # 每個 config 的 VAE 只訓練一次（FW 不影響 AE input）
             for n_layers, ratio_label in param_configs:
                 ratio   = BOTTLENECK_RATIOS[ratio_label]
                 n_units = max(2, round(input_dim * ratio))
                 cfg_label = f"h{n_layers}-{ratio_label}"
 
                 try:
-                    DF_maj, DF_tst = train_and_extract_dae(
+                    DF_maj, DF_tst = train_and_extract_vae(
                         X_maj_s, X_tst_s, n_layers, n_units)
                 except Exception as e:
-                    print(f"  [ERROR] Fold{fold} {cfg_label}: DAE 失敗 {e}")
+                    print(f"  [ERROR] Fold{fold} {cfg_label}: VAE 失敗 {e}")
                     continue
 
                 # === H 修正後的 pipeline ===
@@ -720,7 +764,7 @@ def write_overall_all(ws, df):
     total_cols = 3 + len(METRIC_COLS)
     ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
     c = ws["A1"]
-    c.value     = "Overall Mean（all configs, all datasets & folds）- H: DF-side Feature Weighting (DAE)"
+    c.value     = "Overall Mean（all configs, all datasets & folds）- H: DF-side Feature Weighting (VAE)"
     c.font      = Font(name="Arial", bold=True, size=13, color="1F3864")
     c.alignment = CENTER_ALIGN
 
@@ -760,7 +804,7 @@ def write_overall_best(ws, df):
     total_cols = 3 + len(METRIC_COLS)
     ws.merge_cells(f"A1:{get_column_letter(total_cols)}1")
     c = ws["A1"]
-    c.value     = "Overall Mean（best config per dataset）- H: DF-side Feature Weighting (DAE)"
+    c.value     = "Overall Mean（best config per dataset）- H: DF-side Feature Weighting (VAE)"
     c.font      = Font(name="Arial", bold=True, size=13, color="1F3864")
     c.alignment = CENTER_ALIGN
 
@@ -818,7 +862,7 @@ def save_excel(df_all, df_best):
 # ─────────────────────────── Entry Point ─────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 68)
-    print("實驗二 / Phase 1：H — DF 端 Feature Weighting × DAE")
+    print("實驗二 / Phase 1：H — DF 端 Feature Weighting × VAE")
     print(f"AE        : 固定 {AE_TYPE}")
     print(f"FW 方法   : {FW_METHODS}（含 none 內部 baseline）")
     print(f"OCC       : {OCC_TYPES}")
@@ -831,7 +875,7 @@ if __name__ == "__main__":
     print("選擇準則  : AUC 最高")
     print("分頁      : all_per_fold / all_summary / all_overall")
     print("            best_per_fold / best_summary / best_overall")
-    print("Pipeline  : OF → MinMax → DAE → DF → FW → MinMax → OCC")
+    print("Pipeline  : OF → MinMax → VAE → DF (μ) → MinMax → FW → OCC")
     print("=" * 68)
 
     df_all, df_best = run_experiment()
