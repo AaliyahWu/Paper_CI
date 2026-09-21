@@ -1,7 +1,161 @@
 """
-N_study3_ensemble_us_DF_final_v2.py
-===================================
+N_study3_ensemble_us_DF_final_v3_2_fullrun.py
+=============================================
 實驗三（Study Three）路線一／集合運算式 Ensemble Under-sampling（DF_maj）
+【v3.2 = 正式全跑版：17 資料集 × 4 AE × 21 config】
+
+════════════════════════════════════════════════════════════════════════
+v3.2 相對 v3.1 的修正
+────────────────────────────────────────────────────────────────────────
+[路徑] 輸出全部回到 results/ 底下（不再開 RUN_ID 子資料夾）。
+       子資料夾原本是避免蓋掉 v2 舊檔的機制，拿掉後改用兩層保護：
+         • OUT_PREFIX 檔名前綴 → 不會與 v2 的 Study3_ensemble_us_DF.xlsx、
+           mask_cache、Study3_ckpt_*.csv 撞名；
+         • 設定簽章不符直接中止 → 現在這是唯一防線，更不能省。
+
+[P0-E] checkpoint 改為「每個資料集一組檔」。
+       v3.1 所有資料集共用一個 CSV：某資料集重跑時舊列仍留著，
+       load_checkpoint 去重又保留先出現者 → 重跑後讀回的反而是舊結果。
+       v3.2 改為 results/<prefix>_ckpt/records__<dataset>.csv 等四個檔，
+       並在（重）跑該資料集前 clear_dataset_checkpoint() 整組刪除，
+       新舊不可能混用；合併時也不再需要跨檔去重。
+
+[P0-F] 簽章拆成 hard / soft 兩層。
+       v3.1 的簽章只涵蓋執行範圍，中途改 AE_EPOCHS 或 ENN k 仍會錯誤續跑。
+       v3.2：
+         • hard signature（不符即中止）＝ 會改變數值的一切：AE / sampler /
+           OCC 超參數、縮放政策、判定門檻、指標欄位、亂數設定，
+           以及【所有 train/test 檔的合併指紋】。
+         • soft info（僅警告並留痕）＝ 程式檔 SHA-256 與套件版本。
+           改個註解不該逼你重跑 20 小時，但要記錄下來寫進論文的執行環境。
+
+[P1-G] 等價率的分母改成「該策略自己有效的 cell 數」。
+       原本用所有策略共用的 cell 數當分母，遇到投票者 fallback 時
+       該策略的等價率會被低估。
+
+[P1-H] 統整輸出修正（原本的說明是錯的，會害你把兩個 study 併壞）：
+       • ak_all_export / ak_primary_export 都【排除 rate-matched 列】——
+         那是同一策略的多次隨機重抽，不是一種 sampler，併進去會讓任何
+         「依 Sampler 平均」的動作被灌歪；它們仍保留在 all_per_fold。
+       • 新增 ak_primary_export：只含預先指定的 PRIMARY_AE × PRIMARY_CONFIG，
+         這才是可以和 A~M 並列呈現的那組列。
+       • 明確【不要】把本檔丟進 L_merge_study2_comparison.py：
+         L 是 Study 2 合併器，要求 ak_best_export，而本檔刻意不產生它
+         （per-dataset oracle 是上界不是成績）。要並列就用 ak_primary_export
+         另開一個區塊，且永遠不要拿 N 的絕對 AUC 去減 J 的。
+
+[說明] 結果的正確講法（pilot 已證實，正式 run 也應沿用這個敘事）：
+       S1 與 none 等價、S4 與 ENN 等價，兩者都不構成 ensemble 的新貢獻；
+       S3 刪除約 92%，三個 OCC 都差且普遍輸給同刪除量的隨機刪除；
+       只有 S2_Majority 是既非等價又實務可行的新策略，而它在 pilot 中
+       只對 LOF 有利（ΔAUC vs ENN = +0.0087，且贏過同刪除量隨機 +0.0249），
+       對 OCSVM / iForest 分別是 −0.0521 / −0.0357。
+       因此研究問題要寫成「ensemble under-sampling 是否、以及在哪一種
+       OCC／表徵條件下能優於單一 ENN」，而不是預設它全面勝出。
+════════════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════════════
+v3.1 相對 v3 的修正（全部來自實跑後的審查，逐條說明「為什麼」）
+────────────────────────────────────────────────────────────────────────
+[P0-A] 執行隔離：所有輸出改到 results/<RUN_ID>/ 底下。
+       v3 的 xlsx / mask_cache / checkpoint 檔名與 v2 相同，全跑會直接覆蓋
+       pilot 的結果與快取。RUN_ID 由 RUN_MODE + VOTER_PRESET + CONFIG_MODE
+       自動組出，不同設定的 run 永遠不會互相污染。
+
+[P0-B] 完成清單（completion manifest）取代「看 Dataset 名稱是否出現過」。
+       v3 只要某資料集出現在 checkpoint 就跳過。但若該資料集是在
+       「部分 fold 失敗」或「上一輪用不同 config 範圍」的情況下寫入的，
+       續跑就會永久跳過它，最後得到 pilot 與 full 混在一起的結果。
+       v3.1 改為：
+         • 每個資料集記錄實際完成的 (fold, AE, config) 格子數與預期格子數，
+           只有「完全相符」才算完成；
+         • manifest 存 RUN_SIGNATURE（模式、AE 清單、config 清單、投票者、
+           seed 模式、策略清單、RM 設定）。簽章不符直接中止並說明原因，
+           不會默默混用。
+
+[P0-C] invalid_log 不再去重。v3 的 load_checkpoint 去重鍵沒有 Reason/Detail，
+       同一格的多個失敗原因會被壓成一筆，論文要交代排除情形時會少算。
+
+[P0-D] categorical 資料集政策化。v3 只印警告仍照算平均；
+       train/test 各自 pd.Categorical().codes 可能讓同一個類別對到不同數值，
+       DF 與測試座標會錯位。v3.1 預設 CATEGORICAL_POLICY="exclude"：
+       正式 run 直接排除並記錄在 alignment_notes，不讓它污染 17 資料集平均。
+
+[P1-A] 「事前固定 config」正名。v3 的 fixed_config_pick 是用全資料集的
+       test AUC 去挑 none 平均最佳者 —— 即使與策略無關，那仍然是看過測試
+       結果之後的選模，不能叫 confirmatory。v3.1 拆成三層，定位寫死在表頭：
+         1. primary_config_comparison ← ★主分析★
+            用開跑前就寫死的 PRIMARY_CONFIG（預設 VAE + h1-1/1），
+            理由是「latent 維度等於輸入維度、不涉及壓縮強度的選擇」，
+            這個理由在看到任何結果之前就成立。
+         2. rank_stability ← ★最強的證據，且完全不需要選 config★
+            統計「在 21 個 config 中，S2 贏過 ENN 的 config 有幾個」。
+            結論不依賴任何一次選擇，口試最難被攻擊。
+         3. global_none_selected_config（原 fixed_config_pick）
+            明確標為 exploratory / post-hoc，只能當敏感度分析。
+
+[P1-B] oracle 表正名為 strategy_specific_oracle：它讓每個策略各自挑最佳
+       config，只能與 12_J 分頁對照，【不可】用來宣稱 ensemble 優於 ENN。
+       表內每列都帶 Caveat 欄。
+
+[P1-C] rate-matched 的勝負改為 Win / Tie / Loss 三欄並加容忍值。
+       v3 只數嚴格 ">"，但實跑發現 OCSVM×S2 在 300 次比較中有 20 次
+       AUC 完全相同；浮點微差會讓「勝出次數」在 177~180 之間飄動。
+       改為明確報出平手數，並以 BeatRate=Win/(Win+Loss) 排除平手，
+       數字才穩定可重現。另新增 RM_Scope 欄註明這是
+       representative-cell analysis（僅 RM_AE × RM_CONFIGS），不可外推。
+
+[P1-D] strategy_equivalence 補上真正的分母：nValidCells / nEquivalentCells /
+       EquivalenceRate。v3 只統計「發生等價的格子數」，無法說出
+       「S1 在 100% 還是 67% 的有效格子中等於 none」。
+
+[P1-E] VOTER_PRESET 加註與新增 "diverse" 選項。
+       "expanded"（ENN k=3/5/7 + CNN + TL）會讓 ENN 家族拿到 5 票中的 3 票，
+       本質上是加權 ENN，不是五種同等多樣的方法，只能當探索性敏感度分析。
+       "diverse"（ENN/CNN/TL/NCR/OSS）才是真正擴充方法多樣性的版本。
+       兩者都不預設啟用，主分析維持與 Study 2 對齊的 ENN/CNN/TL。
+
+[P1-F] 用詞精確化（會直接寫進論文，所以在程式內就寫對）：
+       S1_Union ≡ none、S4(ENN∩TL) ≡ ENN 是「等價」；
+       S3_Intersection 並非等價，它是有效但過度激進（刪除率約 92%）。
+       正確說法：本 pilot 中只有 S2_Majority 同時具備「非等價」與「實務可行」。
+       另外刪除集合是在 DF 空間產生的，會受資料集 / AE / config / seed 影響，
+       不能宣稱不受 pilot 條件限制。
+════════════════════════════════════════════════════════════════════════
+
+════════════════════════════════════════════════════════════════════════
+v3 相對 v2 新增（全跑才需要的東西）
+────────────────────────────────────────────────────────────────────────
+[V3-1] 全跑設定：RUN_MODE="full" → 全部資料集 × 4 AE × 21 config（grid）。
+       AE 訓練數 = 17 × 5 × 4 × 21 = 7140，與 baseline B / J 同一量級
+       （你已經跑過一次，所以時間是可預期的）。
+
+[V3-2] 遮罩去重（mask dedup）：pilot 已證實 S1_Union ≡ none、S4(ENN∩TL) ≡ ENN。
+       同一個 cell 內若兩個策略產生完全相同的 keep mask，OCC 只跑一次、
+       其餘直接複用，並把等價關係記進 strategy_equivalence 分頁。
+       這讓 8 個策略的實際 OCC 成本降到約 5 個，而且等價關係本身就是論文結果。
+
+[V3-3] rate-matched 不隨 21 config 膨脹：只在 RM_AE × RM_CONFIGS 指定的
+       代表性格子上跑（預設 VAE × h1-1/1 × 30 次）。
+       否則 7140 cells × 3 策略 × 30 次 × 3 OCC ≈ 193 萬次 OCC 擬合，不可行。
+
+[V3-4] 斷點續跑：每跑完一個資料集就把結果 append 到 checkpoint CSV；
+       重跑時自動跳過已完成的資料集。全跑數小時，中途斷掉不會全部重來。
+
+[V3-5] config 政策雙軌報告：
+       • config_sensitivity：每個 config 在 17 資料集上的平均表現
+         → 用【事前規則】挑固定 config：以 none 基準條件（不是任何策略）
+           在 17 資料集上平均最佳者，再檢查策略排名是否跨 config 穩定。
+       • oracle_best：比照 J 的 per-dataset 最佳 config，明確標為上界，
+         只用來與 12_J 分頁對照，不可當成固定 config 的成績。
+
+[V3-6] 可擴充投票者：pilot 發現 3 個投票者只產生【一個】非退化策略
+       （見 alignment_notes 的 pilot findings）。VOTER_PRESET="expanded"
+       可切成 ENN(k=3/5/7) + CNN + TL 五個投票者，門檻 1~5 連續可調，
+       直接得到「刪除率 vs AUC」曲線。預設仍為 study2_aligned 三個投票者。
+
+[V3-7] 啟動時印出規模與時間估算，避免不小心開一個跑三天的 job。
+════════════════════════════════════════════════════════════════════════
 
 v2 相對 v1 的修正（依兩份審查意見逐條處理，並標明哪些「不採納」及理由）
 ────────────────────────────────────────────────────────────────────────
@@ -109,7 +263,8 @@ import itertools
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from hashlib import sha1
+from hashlib import sha1, sha256
+from time import perf_counter
 
 import sklearn
 from sklearn.preprocessing import MinMaxScaler
@@ -123,6 +278,7 @@ from sklearn.metrics import (
 import imblearn
 from imblearn.under_sampling import (
     EditedNearestNeighbours, CondensedNearestNeighbour, TomekLinks,
+    NeighbourhoodCleaningRule, OneSidedSelection,
 )
 
 import scipy
@@ -138,12 +294,14 @@ from openpyxl.utils import get_column_letter
 
 # ─────────────────────────── 路徑設定 ────────────────────────────────────────
 DATA_ROOT   = Path("data")
-RESULTS_DIR = Path("results")
-OUTPUT_FILE = RESULTS_DIR / "Study3_ensemble_us_DF.xlsx"
-CACHE_DIR   = RESULTS_DIR / "mask_cache"
-WARN_LOG    = RESULTS_DIR / "Study3_warnings.log"
-PROFILE_CSV = RESULTS_DIR / "dataset_profile.csv"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR = Path("results")      # 依需求：輸出一律放在 results/ 底下，不再開 RUN_ID 子資料夾
+
+# ── 覆蓋防護（取代原本的 RUN_ID 資料夾隔離）──
+# 拿掉子資料夾之後，避免蓋掉 v2 舊檔的方式改為「檔名前綴」＋「設定簽章」：
+#   • 所有 v3.2 產物都帶 OUT_PREFIX，不會與 v2 的
+#     Study3_ensemble_us_DF.xlsx / mask_cache / Study3_ckpt_*.csv 撞名；
+#   • 簽章不符時直接中止（現在這是唯一的防線，所以更不能拿掉）。
+OUT_PREFIX = "Study3_N_v32"
 
 # warning 不再整批吞掉：console 安靜，但全部寫進 log（final run 必須留痕）
 warnings.simplefilter("always")
@@ -176,23 +334,66 @@ VAE_BETA      = 1.0
 SCAN_ONLY    = False
 OVERLAP_ONLY = False
 
-RUN_MODE = "pilot"   # "pilot" / "full"
+# RUN_MODE：
+#   "full"       ★正式全跑★ 全部資料集 × 4 AE × 21 config。與 B/J 同量級。
+#   "full_vae"   收斂版：全部資料集 × 僅 VAE × 21 config。若時間不夠先跑這個，
+#                Study 3 的自變數本來就是「策略」而不是「哪個 AE 最好」。
+#   "pilot"      少量資料集，只用來debug，不可拿來下結論。
+RUN_MODE = "full"
 
-if RUN_MODE == "pilot":
-    # ⚠️ 跑 SCAN_ONLY 之後把挑好的 6 個資料集填進來，不要留空用 DATASET_LIMIT 取前六個
+if RUN_MODE == "full":
+    DATASET_WHITELIST = []                          # 空 = 全跑
+    DATASET_LIMIT     = 0
+    AE_TYPES          = ["AE", "DAE", "SAE", "VAE"] # 順序與 B/J 相同
+    CONFIG_MODE       = "grid"                      # 21 configs
+    FIXED_CONFIGS     = ["h1-1/1"]                  # grid 模式下僅作為 RM 的代表格
+    N_RM_REPEATS      = 30
+elif RUN_MODE == "full_vae":
+    DATASET_WHITELIST = []
+    DATASET_LIMIT     = 0
+    AE_TYPES          = ["VAE"]
+    CONFIG_MODE       = "grid"
+    FIXED_CONFIGS     = ["h1-1/1"]
+    N_RM_REPEATS      = 30
+else:                                               # pilot（debug 用）
     DATASET_WHITELIST = []
     DATASET_LIMIT     = 6
     AE_TYPES          = ["VAE"]
+    CONFIG_MODE       = "fixed"
     FIXED_CONFIGS     = ["h1-1/1"]
     N_RM_REPEATS      = 10
-else:
-    DATASET_WHITELIST = []
-    DATASET_LIMIT     = 0
-    AE_TYPES          = ["VAE"]     # Study 3 的自變數是策略，不是 AE；4 AE 放 appendix
-    FIXED_CONFIGS     = ["h1-1/1"]
-    N_RM_REPEATS      = 30
 
-CONFIG_MODE = "fixed"    # "fixed"（不做 per-dataset oracle）/ "grid"（比照 J，僅供對照）
+# ── rate-matched 的範圍限制（V3-3）──
+# 若讓 RM 跟著 21 config × 4 AE 一起跑：
+#   7140 cells × 3 vote 策略 × 30 次 × 3 OCC ≈ 193 萬次 OCC 擬合 → 不可行。
+# RM 的目的是「在一個代表性的表徵下，證明刪除位置有貢獻」，不需要掃遍所有 config。
+RM_AE      = "VAE"
+RM_CONFIGS = ["h1-1/1"]
+
+# ── P1-A 主分析用的 config（開跑前寫死，不可看到結果後再改）──
+# 選 h1-1/1 的理由必須在看到任何結果之前就成立：單一隱藏層、latent 維度等於
+# 輸入維度，不涉及「壓縮強度」這個額外選擇，因此 Study 3 的自變數乾淨地只剩
+# 「子集選取策略」。這不是因為它在 oracle 表上最好（那會是 post-hoc 選模）。
+PRIMARY_AE     = "VAE"
+PRIMARY_CONFIG = "h1-1/1"
+
+# ── 遮罩去重（V3-2）──
+# pilot 已證實 S1_Union ≡ none、S4(ENN∩TL) ≡ ENN。同 cell 內相同 keep mask 的策略
+# 只跑一次 OCC，其餘複用並記錄等價關係（等價關係本身就是論文結果）。
+DEDUP_IDENTICAL_MASKS = True
+
+# ── 斷點續跑（V3-4 / P0-B）──
+# 只有「完成格子數 == 預期格子數」且 RUN_SIGNATURE 相符的資料集才會被跳過。
+RESUME = True
+
+# ── P0-D categorical 資料集政策 ──
+#   "exclude" ★正式 run 預設★ 直接排除含 categorical 欄位的資料集並記錄。
+#             理由：parse_keel_dat（與 A~M 逐字相同）對 train / test 各自
+#             pd.Categorical().codes，同一個類別在 train 與 test 可能對到不同
+#             數值，DF 與測試座標會錯位，混進 17 資料集平均會污染結論。
+#   "warn"    只警告仍納入（＝ v3 的行為，僅供與舊結果對照）。
+#   要真正修正就得整批修 A~M 再重跑，不能只修 N。
+CATEGORICAL_POLICY = "exclude"
 
 # SEED_MODE：
 #   "stable_per_cell" → 每個 (dataset, fold, AE, config) 用 stable hash 決定 seed。
@@ -213,6 +414,8 @@ ALL_METRIC_COLS   = METRIC_COLS + EXTRA_METRIC_COLS
 
 ENABLE_RATE_MATCHED = True
 RM_SEED             = 2025
+# AUC 是排序統計量，小資料集常出現完全相同的值；平手必須獨立計數而非併入敗場。
+RM_TIE_TOL          = 1e-12
 
 # 任一投票者 fallback → 該 cell 的 vote 策略全部作廢（不讓失敗者投「全留」）
 STRICT_FALLBACK = True
@@ -226,7 +429,24 @@ if SEED_MODE == "legacy_global":
     np.random.seed(GLOBAL_SEED)
 
 # ══════════════════════════ 投票者與策略定義 ════════════════════════════════
-BASE_METHODS = ["ENN", "CNN", "TL"]
+# VOTER_PRESET：
+#   "study2_aligned" → ENN / CNN / TL 三個，與 Study 2 完全對齊（預設）
+#   "diverse"        → ENN / CNN / TL / NCR / OSS 五個投票者（建議的擴充方式）
+#   "expanded"       → ENN(k=3/5/7) + CNN + TL 五個投票者。
+#     pilot 發現三個投票者只產生【一個】非退化策略（S1≡none、S4≡ENN），
+#     擴充後門檻 t 從 1 到 5 連續可調，刪除率變成可掃描的旋鈕，
+#     可直接畫「刪除率 vs AUC」曲線。要用時記得同時設 AUTO_THRESHOLD_SWEEP=True。
+VOTER_PRESET = "study2_aligned"
+
+_VOTER_SETS = {
+    "study2_aligned": ["ENN", "CNN", "TL"],
+    # ⚠️ ENN 家族拿到 5 票中的 3 票 → 本質上是「加權 ENN」，不是五種同等多樣的
+    #    方法。只能當探索性敏感度分析，不可取代主分析。
+    "expanded":       ["ENN_k3", "ENN_k5", "ENN_k7", "CNN", "TL"],
+    # 真正擴充「方法多樣性」的版本：五種不同刪除哲學，沒有任何一族佔多數。
+    "diverse":        ["ENN", "CNN", "TL", "NCR", "OSS"],
+}
+BASE_METHODS = _VOTER_SETS[VOTER_PRESET]
 ENN_K, CNN_K, CNN_SEED = 3, 1, 42
 
 AUTO_THRESHOLD_SWEEP = False   # True → 產生 T1..TK 全門檻（刪除率掃描曲線用）
@@ -260,7 +480,7 @@ def build_strategy_specs():
 
 STRATEGY_SPECS = build_strategy_specs()
 STRATEGIES     = list(STRATEGY_SPECS.keys())
-PRIMARY_BASELINE = "ENN"   # Study 3 的主要對照：ensemble 有沒有比 single best 好
+PRIMARY_BASELINE = "ENN" if "ENN" in BASE_METHODS else "ENN_k3"   # Study 3 的主要對照：ensemble 有沒有比 single best 好
 
 # ── 統整 metadata ──
 STUDY_ID           = "N"
@@ -290,6 +510,127 @@ ACTIVE_CONFIGS = ALL_CONFIGS if CONFIG_MODE == "grid" else [
 
 
 # ─────────────────────────── 工具 ────────────────────────────────────────────
+# ══════════════════════════ 輸出路徑（依 RUN_ID 隔離）══════════════════════
+RUN_TAG     = (f"{RUN_MODE}_{VOTER_PRESET}_{CONFIG_MODE}"
+               f"_ae{len(AE_TYPES)}_cfg{len(ACTIVE_CONFIGS)}")
+CACHE_DIR   = RESULTS_DIR / f"{OUT_PREFIX}_mask_cache"
+CKPT_DIR    = RESULTS_DIR / f"{OUT_PREFIX}_ckpt"          # 每個資料集一組檔案
+OUTPUT_FILE = RESULTS_DIR / f"{OUT_PREFIX}_{RUN_TAG}.xlsx"
+WARN_LOG    = RESULTS_DIR / f"{OUT_PREFIX}_warnings.log"
+PROFILE_CSV = RESULTS_DIR / f"{OUT_PREFIX}_dataset_profile.csv"
+MANIFEST    = RESULTS_DIR / f"{OUT_PREFIX}_manifest.json"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+# 每個資料集自己一組 checkpoint 檔（P0-E）。
+# 舊版所有資料集共用一個 CSV，重跑某個資料集時舊列不會被移除，
+# load_checkpoint 的去重又保留先出現者 → 重跑後反而讀回舊結果。
+def ckpt_paths(ds_name):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", ds_name)
+    return {
+        "main": CKPT_DIR / f"records__{safe}.csv",
+        "ovl":  CKPT_DIR / f"overlap__{safe}.csv",
+        "eqv":  CKPT_DIR / f"equiv__{safe}.csv",
+        "inv":  CKPT_DIR / f"invalid__{safe}.csv",
+    }
+
+
+def clear_dataset_checkpoint(ds_name):
+    """重跑某資料集前，先把它既有的 checkpoint 全部刪掉，杜絕新舊混用。"""
+    for f in ckpt_paths(ds_name).values():
+        if f.exists():
+            f.unlink()
+
+
+def _sha256_of_file(path):
+    try:
+        return sha256(Path(path).read_bytes()).hexdigest()[:16]
+    except Exception:
+        return "unavailable"
+
+
+def script_fingerprint():
+    return _sha256_of_file(__file__) if "__file__" in globals() else "unavailable"
+
+
+def data_fingerprint(dataset_dirs):
+    """所有 train/test 檔指紋的合併摘要：資料換了就會變，避免錯誤續跑。"""
+    h = sha256()
+    for d in sorted(dataset_dirs, key=lambda x: x.name):
+        for fold in range(1, N_FOLDS + 1):
+            tra, tst = find_fold_files(d, d.name, fold)
+            for f in (tra, tst):
+                if f is not None:
+                    h.update(d.name.encode())
+                    h.update(sha1(Path(f).read_bytes()).digest())
+    return h.hexdigest()[:16]
+
+
+def run_signature(data_fp="not_computed"):
+    """會影響數值的設定 → 不符就中止（hard signature）。
+
+    v3.1 只涵蓋執行範圍，改了 AE_EPOCHS 或 ENN k 仍會錯誤續跑。
+    v3.2 把「所有會改變結果的東西」都納入：AE / OCC / sampler 超參數、
+    縮放政策、判定門檻、指標欄位，以及資料檔本身的指紋。
+    """
+    return {
+        "run_mode": RUN_MODE, "ae_types": list(AE_TYPES),
+        "configs": list(ACTIVE_CONFIGS), "config_mode": CONFIG_MODE,
+        "voter_preset": VOTER_PRESET, "base_methods": list(BASE_METHODS),
+        "strategies": list(STRATEGIES), "seed_mode": SEED_MODE,
+        "global_seed": GLOBAL_SEED,
+        "n_folds": N_FOLDS, "occ": list(OCC_TYPES),
+        "rate_matched": bool(ENABLE_RATE_MATCHED), "rm_ae": RM_AE,
+        "rm_configs": list(RM_CONFIGS), "rm_repeats": N_RM_REPEATS,
+        "rm_seed": RM_SEED, "rm_tie_tol": RM_TIE_TOL,
+        "strict_fallback": bool(STRICT_FALLBACK),
+        "categorical_policy": CATEGORICAL_POLICY,
+        "dedup_masks": bool(DEDUP_IDENTICAL_MASKS),
+        # ── 會改變數值的超參數（v3.1 漏掉的部分）──
+        "ae_hparams": {"epochs": AE_EPOCHS, "batch": AE_BATCH_SIZE, "lr": AE_LR,
+                       "dae_noise": DAE_NOISE, "sae_sparsity": SAE_SPARSITY,
+                       "vae_beta": VAE_BETA},
+        "sampler_hparams": {"enn_k": ENN_K, "cnn_k": CNN_K, "cnn_seed": CNN_SEED},
+        "occ_hparams": {"ocsvm": "nu=0.1,rbf,gamma=scale",
+                        "lof": "k=min(20,n-1),novelty=True,contamination=0.1",
+                        "iforest": "n_estimators=100,contamination=0.1,rs=42",
+                        "threshold_pct": 90},
+        "scale_mode": SAMPLER_SCALE_MODE,
+        "metrics": list(ALL_METRIC_COLS),
+        "data_fingerprint": data_fp,
+    }
+
+
+def run_soft_info():
+    """記錄用、不觸發中止：改個註解不該逼你重跑 20 小時，但要留痕。"""
+    return {
+        "script_sha256": script_fingerprint(),
+        "python": platform.python_version(), "numpy": np.__version__,
+        "pandas": pd.__version__, "sklearn": sklearn.__version__,
+        "imblearn": imblearn.__version__, "scipy": scipy.__version__,
+        "torch": torch.__version__,
+    }
+
+
+def expected_cells_per_dataset():
+    """一個資料集「完全跑完」應有的 (fold × AE × config) 格子數。"""
+    return N_FOLDS * len(AE_TYPES) * len(ACTIVE_CONFIGS)
+
+
+def load_manifest():
+    if not MANIFEST.exists():
+        return {"signature": None, "datasets": {}}
+    try:
+        return json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except Exception:
+        return {"signature": None, "datasets": {}}
+
+
+def save_manifest(man):
+    """manifest 同時存 hard signature（不符即中止）與 soft info（僅警告）。"""
+    MANIFEST.write_text(json.dumps(man, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def safe_removed_rate(n_removed, n_kept):
     denom = int(n_removed) + int(n_kept)
     return float(n_removed / denom) if denom > 0 else 0.0
@@ -318,17 +659,99 @@ def file_fingerprint(path):
     return sha1(Path(path).read_bytes()).hexdigest()[:16]
 
 
+def mask_signature(keep):
+    """keep mask 的指紋，用來判斷兩個策略是否產生完全相同的訓練子集。"""
+    return sha1(np.packbits(keep).tobytes()).hexdigest()
+
+
+def _append_csv(path, rows):
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    header = not path.exists()
+    df.to_csv(path, mode="a", header=header, index=False, encoding="utf-8-sig")
+
+
+def flush_checkpoint(ds_name, main_rows, ovl_rows, eqv_rows, inv_rows):
+    """每完成一個資料集就落地，且【寫進該資料集專屬的檔案】。
+
+    P0-E：舊版所有資料集共用一個 CSV。重跑某個資料集時舊列還在，
+    load_checkpoint 去重又保留先出現者 → 重跑之後讀回的反而是舊結果。
+    改成一個資料集一組檔，重跑前先 clear_dataset_checkpoint() 整組刪除，
+    新舊不可能混用。
+    """
+    paths = ckpt_paths(ds_name)
+    _append_csv(paths["main"], main_rows)
+    _append_csv(paths["ovl"], ovl_rows)
+    _append_csv(paths["eqv"], eqv_rows)
+    _append_csv(paths["inv"], inv_rows)
+
+
+def load_all_checkpoints(kind, extra_rows):
+    """把所有資料集的 checkpoint 檔與本次記憶體中的資料合併成一張表。
+
+    因為每個資料集一組檔、重跑前整組刪除，這裡不需要（也不應該）跨檔去重：
+    檔案裡本來就不會同時存在同一資料集的新舊兩份。
+    """
+    frames = []
+    for f in sorted(CKPT_DIR.glob(f"{kind}__*.csv")):
+        try:
+            frames.append(pd.read_csv(f))
+        except Exception as e:
+            print(f"  [WARN] {f.name} 讀取失敗：{e}")
+    if extra_rows:
+        frames.append(pd.DataFrame(extra_rows))
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def print_scale_estimate():
+    """啟動時印出規模，避免不小心開一個跑三天的 job（V3-7）。"""
+    n_ds = len(DATASET_WHITELIST) if DATASET_WHITELIST else (DATASET_LIMIT or 17)
+    n_cells = n_ds * N_FOLDS * len(AE_TYPES) * len(ACTIVE_CONFIGS)
+    uniq = max(2, len(STRATEGIES) - 2) if DEDUP_IDENTICAL_MASKS else len(STRATEGIES)
+    occ_main = n_cells * uniq * len(OCC_TYPES)
+    rm_cells = n_ds * N_FOLDS * len([c for c in ACTIVE_CONFIGS if c in RM_CONFIGS]) \
+               * (1 if RM_AE in AE_TYPES else 0)
+    n_vote = sum(1 for k in STRATEGIES if STRATEGY_SPECS[k][0] == "vote")
+    occ_rm = rm_cells * n_vote * N_RM_REPEATS * len(OCC_TYPES) if ENABLE_RATE_MATCHED else 0
+    print(f"規模估算   : 資料集≈{n_ds} × fold {N_FOLDS} × AE {len(AE_TYPES)} "
+          f"× config {len(ACTIVE_CONFIGS)} = {n_cells:,} 個 AE 訓練")
+    print(f"             OCC 擬合 ≈ {occ_main:,}（主）+ {occ_rm:,}（rate-matched）"
+          f" = {occ_main + occ_rm:,}")
+    if occ_main + occ_rm > 400_000:
+        print("⚠️  規模偏大。建議改 RUN_MODE='full_vae'，或縮小 RM_CONFIGS。")
+    # 防呆：RM 指定的 AE / config 若不在本次執行範圍內，rate-matched 會靜默完全不跑
+    if ENABLE_RATE_MATCHED:
+        missing_cfg = [c for c in RM_CONFIGS if c not in ACTIVE_CONFIGS]
+        if missing_cfg or RM_AE not in AE_TYPES:
+            print(f"⚠️  rate-matched 不會執行：RM_AE={RM_AE}(在本次 AE 清單中={RM_AE in AE_TYPES})"
+                  f"、RM_CONFIGS 缺少 {missing_cfg}。請調整 RM_AE / RM_CONFIGS。")
+
+
 # ─────────────────────────── Under-sampling keep mask ───────────────────────
 def make_sampler(name):
     """Sampler 超參數與 I/J/K 逐字相同。"""
-    if name == "ENN":
+    if name in ("ENN", "ENN_k3"):
         return EditedNearestNeighbours(
             n_neighbors=ENN_K, kind_sel="all", sampling_strategy="auto")
+    if name == "ENN_k5":
+        return EditedNearestNeighbours(
+            n_neighbors=5, kind_sel="all", sampling_strategy="auto")
+    if name == "ENN_k7":
+        return EditedNearestNeighbours(
+            n_neighbors=7, kind_sel="all", sampling_strategy="auto")
     if name == "CNN":
         return CondensedNearestNeighbour(
             n_neighbors=CNN_K, random_state=CNN_SEED, sampling_strategy="auto")
     if name == "TL":
         return TomekLinks(sampling_strategy="auto")
+    if name == "NCR":
+        return NeighbourhoodCleaningRule(n_neighbors=ENN_K)
+    if name == "OSS":
+        return OneSidedSelection(n_neighbors=CNN_K, random_state=CNN_SEED,
+                                 sampling_strategy="auto")
     return None
 
 
@@ -769,13 +1192,75 @@ def run_experiment():
 
     if SCAN_ONLY:
         scan_datasets(dataset_dirs)
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    all_records, overlap_records, invalid_records = [], [], []
+    all_records, overlap_records, invalid_records, equiv_records = [], [], [], []
+    overlap_records_flushed, equiv_records_flushed, invalid_flushed = [], [], []
     categorical_datasets = set()
+
+    # ── V3-4 斷點續跑：略過 checkpoint 中已完成的資料集 ──
+    # ── P0-B 完成清單續跑：只跳過「格子數完全相符」且設定簽章相同的資料集 ──
+    man = load_manifest()
+    data_fp = data_fingerprint(dataset_dirs)
+    sig = run_signature(data_fp)
+    soft = run_soft_info()
+    # soft 資訊（程式 SHA-256、套件版本）只警告不中止：
+    # 改個註解不該逼你重跑 20 小時，但一定要留痕，論文才寫得出執行環境。
+    if man.get("soft_info") and man["soft_info"].get("script_sha256") != soft["script_sha256"]:
+        print(f"⚠️  程式碼與上次續跑時不同（{man['soft_info'].get('script_sha256')} → "
+              f"{soft['script_sha256']}）。若改動會影響數值，請刪除 "
+              f"{CKPT_DIR} 後重跑。")
+    man["soft_info"] = soft
+    if man.get("signature") and man["signature"] != sig:
+        diff = [k for k in sig if man["signature"].get(k) != sig[k]]
+        raise RuntimeError(
+            f"此資料夾({RESULTS_DIR})既有結果的執行設定與本次不同，欄位：{diff}。\n"
+            f"不可混用（例如 pilot 的 1 個 config 與 full 的 21 個 config）。\n"
+            f"請刪除 {CKPT_DIR} 與 {MANIFEST} 後重跑，或改 OUT_PREFIX 另存一份。")
+    man["signature"] = sig
+    exp_cells = expected_cells_per_dataset()
+    done = {d for d, v in man.get("datasets", {}).items()
+            if RESUME and v.get("complete") and v.get("cells_done") == exp_cells}
+    if done:
+        print(f"↻ 續跑：{len(done)} 個資料集已完整完成（每個 {exp_cells} 格），將跳過。")
+    partial = {d: v for d, v in man.get("datasets", {}).items()
+               if not (v.get("complete") and v.get("cells_done") == exp_cells)}
+    if partial:
+        print(f"↻ {len(partial)} 個資料集上次未跑完，本次將重跑：{sorted(partial)}")
+
+    # ── P0-D categorical 政策：正式 run 直接排除，不讓它污染資料集平均 ──
+    excluded_categorical = []
+    if CATEGORICAL_POLICY == "exclude":
+        keep_dirs = []
+        for d in dataset_dirs:
+            tra, _ = find_fold_files(d, d.name, 1)
+            if tra is None:
+                keep_dirs.append(d); continue
+            try:
+                _, _, _, n_cat = parse_keel_dat(tra)
+            except Exception:
+                keep_dirs.append(d); continue
+            if n_cat > 0:
+                excluded_categorical.append(f"{d.name}(cat_cols={n_cat})")
+            else:
+                keep_dirs.append(d)
+        if excluded_categorical:
+            print(f"⚠️  依 CATEGORICAL_POLICY='exclude' 排除 {len(excluded_categorical)} 個"
+                  f"含類別欄位的資料集：{excluded_categorical}")
+            print("   原因：parse_keel_dat 對 train/test 各自編碼，類別可能對到不同數值。")
+        dataset_dirs = keep_dirs
 
     for ds_dir in dataset_dirs:
         ds_name = ds_dir.name
+        if ds_name in done:
+            print(f"↻ 跳過已完成：{ds_name}")
+            continue
+        # 這個資料集要（重）跑 → 先把它既有的 checkpoint 整組刪掉。
+        # 否則重跑產生的新列會與上次失敗留下的舊列並存。
+        clear_dataset_checkpoint(ds_name)
+        ds_t0 = perf_counter()
+        n_rec_before = len(all_records)
+        cells_done = 0          # 本資料集實際完成的 (fold, AE, config) 格子數
         print(f"\n{'='*68}\n▶ Dataset: {ds_name}")
 
         for fold in range(1, N_FOLDS + 1):
@@ -869,6 +1354,10 @@ def run_experiment():
                     if OVERLAP_ONLY:
                         continue
 
+                    cells_done += 1   # AE 與三個 sampler 都成功，這格算完成
+                    # 同 cell 內的遮罩去重：sig -> (strategy, metrics)
+                    mask_cache_local = {}
+
                     for strategy in STRATEGIES:
                         family, voters, threshold, role = STRATEGY_SPECS[strategy]
                         keep, status, valid = apply_strategy(
@@ -882,7 +1371,20 @@ def run_experiment():
 
                         n_kept    = int(keep.sum())
                         n_removed = n_maj - n_kept
-                        mets = eval_all_occ(keep, DF_maj_s, DF_tst_s, y_tst)
+
+                        # ── V3-2 遮罩去重：相同 keep mask 只跑一次 OCC ──
+                        sig = mask_signature(keep) if DEDUP_IDENTICAL_MASKS else None
+                        if sig is not None and sig in mask_cache_local:
+                            src_strategy, mets = mask_cache_local[sig]
+                            equiv_records.append({
+                                "Dataset": ds_name, "AE": ae_type, "Config": cfg_label,
+                                "Fold": fold, "Strategy": strategy,
+                                "EquivalentTo": src_strategy, "MajKept": n_kept,
+                                "RemovedRate": safe_removed_rate(n_removed, n_kept)})
+                        else:
+                            mets = eval_all_occ(keep, DF_maj_s, DF_tst_s, y_tst)
+                            if sig is not None and mets is not None:
+                                mask_cache_local[sig] = (strategy, mets)
                         if mets is None:
                             invalid_records.append({
                                 "Dataset": ds_name, "AE": ae_type, "Config": cfg_label,
@@ -903,7 +1405,10 @@ def run_experiment():
                             all_records.append({**base_row, "OCC": occ_type, **mm})
 
                         # ── rate-matched 隨機對照：逐次保留，不只存平均 ──
-                        if ENABLE_RATE_MATCHED and family == "vote" and n_removed > 0:
+                        rm_here = (ENABLE_RATE_MATCHED and family == "vote"
+                                   and n_removed > 0
+                                   and ae_type == RM_AE and cfg_label in RM_CONFIGS)
+                        if rm_here:
                             for rep in range(1, N_RM_REPEATS + 1):
                                 rng = np.random.default_rng(
                                     stable_hash(RM_SEED, ds_name, fold, ae_type,
@@ -924,22 +1429,44 @@ def run_experiment():
             print(f"  [fold {fold}] 完成 {len(ACTIVE_CONFIGS)} config × "
                   f"{len(AE_TYPES)} AE × {len(STRATEGIES)} 策略 × {len(OCC_TYPES)} OCC")
 
-    if categorical_datasets:
-        print(f"\n⚠️  含 categorical 欄位的資料集：{sorted(categorical_datasets)}")
-        print("   A~M 的編碼方式對 train/test 各自處理，mapping 可能錯位；"
-              "若要修必須整批修 A~M 後重跑。")
+        # ── 每完成一個資料集就落地，之後斷掉不必重跑 ──
+        complete = (cells_done == exp_cells)
+        man.setdefault("datasets", {})[ds_name] = {
+            "cells_done": cells_done, "cells_expected": exp_cells,
+            "complete": bool(complete),
+        }
+        save_manifest(man)
+        if not complete:
+            print(f"  ⚠️  {ds_name} 只完成 {cells_done}/{exp_cells} 格（有 fold/AE 失敗），"
+                  f"未標記完成，下次續跑會重做整個資料集。")
+        flush_checkpoint(ds_name, all_records[n_rec_before:], overlap_records,
+                         equiv_records, invalid_records)
+        overlap_records_flushed.extend(overlap_records); overlap_records.clear()
+        equiv_records_flushed.extend(equiv_records);     equiv_records.clear()
+        invalid_flushed.extend(invalid_records);         invalid_records.clear()
+        print(f"  ✔ {ds_name} 完成（{perf_counter() - ds_t0:.1f}s），已寫入 checkpoint")
 
-    df_all     = pd.DataFrame(all_records)
-    df_overlap = pd.DataFrame(overlap_records)
-    df_invalid = pd.DataFrame(invalid_records)
+    if categorical_datasets:
+        print(f"\n⚠️  本次【納入】的資料集中含 categorical 欄位者：{sorted(categorical_datasets)}")
+        print("   （CATEGORICAL_POLICY='warn' 時才會出現）A~M 對 train/test 各自編碼，"
+              "mapping 可能錯位；正式 run 建議改用 'exclude'，或整批修 A~M 後重跑。")
+    globals()["_EXCLUDED_CATEGORICAL"] = excluded_categorical
+
+    # 續跑時把 checkpoint 內容一併載回，才能產出完整報表
+    # 本次記憶體中的資料已在每個資料集結束時寫進該資料集的檔案，
+    # 這裡只從檔案讀回，避免同一批列被算兩次。
+    df_all     = load_all_checkpoints("records", [])
+    df_overlap = load_all_checkpoints("overlap", [])
+    df_equiv   = load_all_checkpoints("equiv", [])
+    df_invalid = load_all_checkpoints("invalid", [])
 
     if df_all.empty or "AUC" not in df_all.columns:
-        return df_all, df_overlap, df_invalid
+        return df_all, df_overlap, df_invalid, df_equiv
 
     if CONFIG_MODE == "grid":
-        print("\n⚠️  CONFIG_MODE='grid'：ak_best_export 使用 per-dataset oracle 選法，"
+        print("\n⚠️  CONFIG_MODE='grid'：oracle_best 分頁為 per-dataset oracle 選法，"
               "只能當上界報告，不可寫成「固定 config 的成績」。")
-    return df_all, df_overlap, df_invalid
+    return df_all, df_overlap, df_invalid, df_equiv
 
 
 # ─────────────────────────── 分析表 ─────────────────────────────────────────
@@ -1033,11 +1560,20 @@ def build_rate_matched_gap(df):
         AUC_rand_mean="mean", AUC_rand_std="std", n_rep="count").reset_index()
     rw = rm.merge(v[PAIR_KEYS + ["Strategy", "AUC"]].rename(columns={"AUC": "AUC_strat"}),
                   on=PAIR_KEYS + ["Strategy"], how="inner")
-    wins = (rw.assign(win=(rw["AUC_strat"] > rw["AUC"]).astype(int))
-              .groupby(PAIR_KEYS + ["Strategy"])["win"].sum().reset_index()
-              .rename(columns={"win": "StratBeatsRandom_n"}))
 
-    merged = v.merge(r, on=PAIR_KEYS + ["Strategy"]).merge(wins, on=PAIR_KEYS + ["Strategy"])
+    # P1-C：明確區分 Win / Tie / Loss。
+    # 只數嚴格 ">" 會讓計數不穩：實跑中 OCSVM×S2 在 300 次比較裡有 20 次 AUC
+    # 完全相同（AUC 是排序統計量，小資料集本來就容易產生同值），浮點微差就會
+    # 讓「勝出次數」在 177~180 之間飄動。改為報出平手數，並以
+    # BeatRate = Win / (Win + Loss) 排除平手，數字才可重現。
+    d = rw["AUC_strat"] - rw["AUC"]
+    rw["win"]  = (d >  RM_TIE_TOL).astype(int)
+    rw["loss"] = (d < -RM_TIE_TOL).astype(int)
+    rw["tie"]  = ((d.abs() <= RM_TIE_TOL) & d.notna()).astype(int)
+    wl = (rw.groupby(PAIR_KEYS + ["Strategy"])[["win", "loss", "tie"]]
+            .sum().reset_index())
+
+    merged = v.merge(r, on=PAIR_KEYS + ["Strategy"]).merge(wl, on=PAIR_KEYS + ["Strategy"])
     merged["GapAUC"] = merged["AUC"] - merged["AUC_rand_mean"]
 
     keys = ["AE", "OCC", "Config", "Strategy"]
@@ -1047,10 +1583,13 @@ def build_rate_matched_gap(df):
         AUC_rand_mean=("AUC_rand_mean", "mean"),
         AUC_rand_std=("AUC_rand_std", "mean"),
         GapAUC=("GapAUC", "mean"),
-        BeatsRandom=("StratBeatsRandom_n", "sum"),
+        Win=("win", "sum"), Tie=("tie", "sum"), Loss=("loss", "sum"),
         TotalDraws=("n_rep", "sum"),
     ).reset_index()
-    out["BeatRate"] = out["BeatsRandom"] / out["TotalDraws"].replace(0, np.nan)
+    out["BeatRate"] = out["Win"] / (out["Win"] + out["Loss"]).replace(0, np.nan)
+    out["RM_Scope"] = f"representative cell only: AE={RM_AE}, configs={'/'.join(RM_CONFIGS)}"
+    out["Caveat"] = ("位置效應僅在此代表性格子上成立，不可外推到其他 config；"
+                     "若主結論改用別的 config，需在該 config 重跑 rate-matched。")
     return out.sort_values(keys).reset_index(drop=True)
 
 
@@ -1064,6 +1603,161 @@ def build_strategy_overall(df):
     g["_ord"] = g["Strategy"].map(
         lambda s: order.get(s.replace("RM_", ""), 99) + (0.5 if s.startswith("RM_") else 0))
     return g.sort_values(["_ord", "OCC"]).drop(columns=["_ord"]).reset_index(drop=True)
+
+
+def build_config_sensitivity(df):
+    """每個 config 在所有資料集上的平均表現（不做 per-dataset 挑選）。
+
+    用途一：以【事前規則】挑固定 config —— 取 none 基準條件下平均 AUC 最高者。
+            規則只看 none，不看任何策略，因此不會偏袒 ensemble。
+    用途二：檢查「策略排名」是否跨 config 穩定。若 S2 在多數 config 都排在 ENN
+            之前，結論就不依賴 config 的選擇，這比單一 config 的數字有力得多。
+    """
+    if df.empty:
+        return pd.DataFrame()
+    real = df[df["StrategyFamily"] != "rate_matched"]
+    g = (real.groupby(["AE", "OCC", "Config", "Strategy", "Role"])
+              .agg(MeanAUC=("AUC", "mean"),
+                   nDatasets=("Dataset", "nunique")).reset_index())
+    g["StrategyRank"] = (g.groupby(["AE", "OCC", "Config"])["MeanAUC"]
+                          .rank(ascending=False, method="min").astype(int))
+    return g.sort_values(["AE", "OCC", "Config", "StrategyRank"]).reset_index(drop=True)
+
+
+def build_primary_config_comparison(df, ref_strategy):
+    """★主分析★ 只用開跑前寫死的 PRIMARY_AE × PRIMARY_CONFIG 做策略配對比較。
+
+    為什麼這張才是主表：它不涉及任何「看到結果後再選」的動作。
+    config 在開跑前就固定，理由（latent 維度＝輸入維度、不涉壓縮強度選擇）
+    在看到任何 AUC 之前就成立，因此可以作為 confirmatory analysis。
+    """
+    if df.empty:
+        return pd.DataFrame()
+    sub = df[(df["AE"] == PRIMARY_AE) & (df["Config"] == PRIMARY_CONFIG)]
+    if sub.empty:
+        return pd.DataFrame()
+    out = build_dataset_level_paired(sub, ref_strategy)
+    if out.empty:
+        return out
+    out.insert(0, "Analysis", "CONFIRMATORY (pre-specified config)")
+    return out
+
+
+def build_rank_stability(df, ref_strategy):
+    """★選擇無關的證據★ 在所有 config 中，各策略贏過 ref 的 config 有幾個。
+
+    完全不需要挑 config：如果 S2 在 21 個 config 裡有 18 個都贏過 ENN，
+    這個結論就不依賴任何一次選擇，是口試最難被攻擊的說法。
+    統計單位仍是資料集：先在每個 config 內算出 dataset-level 平均 ΔAUC，
+    再看該 config 的整體 ΔAUC 是否為正。
+    """
+    merged = _paired_delta(df, ref_strategy)
+    if merged.empty:
+        return pd.DataFrame()
+    per_cfg = (merged.groupby(["AE", "OCC", "Config", "Strategy", "Role", "Dataset"])
+                     ["ΔAUC"].mean().reset_index()
+                     .groupby(["AE", "OCC", "Config", "Strategy", "Role"])
+                     ["ΔAUC"].mean().reset_index())
+    rows = []
+    for (ae, occ, strat, role), g in per_cfg.groupby(["AE", "OCC", "Strategy", "Role"]):
+        if strat == ref_strategy:
+            continue
+        d = g["ΔAUC"].dropna()
+        rows.append({
+            "Reference": ref_strategy, "AE": ae, "OCC": occ,
+            "Strategy": strat, "Role": role,
+            "nConfigs": int(len(d)),
+            "ConfigsWon": int((d > 0).sum()),
+            "ConfigsLost": int((d < 0).sum()),
+            "ConfigWinRate": float((d > 0).mean()) if len(d) else np.nan,
+            "MeanΔAUC_overConfigs": float(d.mean()) if len(d) else np.nan,
+            "MinΔAUC": float(d.min()) if len(d) else np.nan,
+            "MaxΔAUC": float(d.max()) if len(d) else np.nan,
+        })
+    return pd.DataFrame(rows).sort_values(
+        ["AE", "OCC", "Strategy"]).reset_index(drop=True)
+
+
+def build_global_none_selected_config(df):
+    """探索性：以 none 條件在所有資料集上平均最佳的 config。
+
+    ⚠️ 這【不是】事前固定配置。它是用測試集 AUC 在 21 個 config 中挑出來的，
+    即使挑選規則與策略無關，仍屬 post-hoc 選模，只能當敏感度分析，
+    不可寫成 confirmatory 的主結果。主結果請看 primary_config_comparison。
+    """
+    if df.empty:
+        return pd.DataFrame()
+    real = df[(df["StrategyFamily"] != "rate_matched") & (df["Strategy"] == "none")]
+    if real.empty:
+        return pd.DataFrame()
+    m = real.groupby(["AE", "OCC", "Config"])["AUC"].mean().reset_index()
+    pick = (m.sort_values("AUC", ascending=False)
+             .drop_duplicates(["AE", "OCC"])
+             .rename(columns={"Config": "PickedConfig", "AUC": "none_AUC_at_pick"}))
+    pick["Rule"] = ("argmax over configs of mean none-AUC across datasets "
+                    "— strategy-agnostic but selected on TEST AUC")
+    pick["Status"] = "EXPLORATORY / post-hoc — NOT a pre-specified configuration"
+    return pick.sort_values(["AE", "OCC"]).reset_index(drop=True)
+
+
+def build_strategy_specific_oracle(df):
+    """比照 J 的 per-dataset oracle 選法 —— 僅供與 12_J 分頁對照。
+
+    ⚠️ 選取鍵包含 Strategy，等於【每個策略各自挑自己最好的 config】。
+       因此這張表可以和 12_J 的 per-sampler oracle 對照，
+       但【絕對不可】用來宣稱 ensemble 優於 ENN —— 兩者用的 config 不同，
+       比較的不是同一個表徵。策略優劣一律看 primary_config_comparison
+       與 rank_stability。
+    """
+    if df.empty:
+        return pd.DataFrame()
+    real = df[df["StrategyFamily"] != "rate_matched"].dropna(subset=["AUC"])
+    if real.empty:
+        return pd.DataFrame()
+    per_cfg = (real.groupby(["Dataset", "AE", "Strategy", "OCC", "Config"])["AUC"]
+                   .mean().reset_index())
+    best = (per_cfg.sort_values("AUC", ascending=False)
+                   .drop_duplicates(["Dataset", "AE", "Strategy", "OCC"]))
+    out = (best.groupby(["AE", "Strategy", "OCC"])
+               .agg(OracleMeanAUC=("AUC", "mean"),
+                    nDatasets=("Dataset", "nunique")).reset_index())
+    mode_cfg = (best.groupby(["AE", "Strategy", "OCC"])["Config"]
+                    .agg(lambda x: x.value_counts().idxmax())
+                    .reset_index().rename(columns={"Config": "MostFreqConfig"}))
+    out = out.merge(mode_cfg, on=["AE", "Strategy", "OCC"])
+    out["Caveat"] = ("strategy-specific per-dataset ORACLE upper bound; "
+                     "NOT a fixed-config score and NOT usable for strategy comparison")
+    return out.sort_values(["AE", "OCC", "Strategy"]).reset_index(drop=True)
+
+
+def build_equivalence_summary(df_equiv, df_valid=None):
+    """策略等價統計：哪些策略在多少比例的 cell 中產生了完全相同的訓練子集。
+
+    pilot 已發現 S1_Union ≡ none、S4(ENN∩TL) ≡ ENN，全跑要確認這是否普遍成立。
+    若普遍成立，代表現行投票者組合只產生少數幾個實際不同的子集，
+    這是「必須擴充投票者」的直接證據，本身即為論文結果。
+    """
+    if df_equiv.empty:
+        return pd.DataFrame()
+    g = (df_equiv.groupby(["Strategy", "EquivalentTo"])
+                 .agg(nEquivalentCells=("Fold", "size"),
+                      nDatasets=("Dataset", "nunique")).reset_index())
+    # P1-D：補上真正的分母。沒有分母就無法說「S1 在 100% 還是 67% 的有效格子中
+    # 等於 none」，而這正是論文要下的結論。
+    # 分母必須是「該策略自己有效的 cell 數」，不是所有策略共用的 cell 數。
+    # 若某些 cell 因投票者 fallback 而使該策略作廢，用共用分母會低估等價率。
+    if df_valid is not None and not df_valid.empty:
+        per_strat = (df_valid[df_valid["StrategyFamily"] != "rate_matched"]
+                     .drop_duplicates(["Strategy", "Dataset", "AE", "Config", "Fold"])
+                     .groupby("Strategy").size().rename("nValidCells").reset_index())
+        g = g.merge(per_strat, on="Strategy", how="left")
+    else:
+        g["nValidCells"] = np.nan
+    g["EquivalenceRate"] = g["nEquivalentCells"] / g["nValidCells"]
+    tot = (df_equiv.groupby("Strategy")["Fold"].size()
+                   .rename("nCellsCollapsedAnyTarget").reset_index())
+    return g.merge(tot, on="Strategy").sort_values(
+        ["Strategy", "nEquivalentCells"], ascending=[True, False]).reset_index(drop=True)
 
 
 def build_overlap_summary(df_overlap):
@@ -1153,11 +1847,18 @@ def dump_table(ws, title, df, delta_cols=None, fmt="0.0000"):
 
 
 # ─────────────────────────── 統整輸出（schema 與 I/J/K 相同）────────────────
-def make_ak_export_df(df, config_policy):
+def make_ak_export_df(df, config_policy, primary_only=False):
     """欄位與 I/J/K 的 COMPARISON_EXPORT_COLS 逐欄相同；Strategy 寫進 Sampler。
 
     PR-AUC 等本檔額外指標刻意不放進來，確保 L_merge 讀到的 schema 一致。
     """
+    if df.empty:
+        return pd.DataFrame(columns=COMPARISON_EXPORT_COLS)
+    # rate-matched 是同一個策略的多次隨機重抽，不是一種 sampler。
+    # 若把它併進統整表，任何「依 Sampler 平均」的動作都會被重複抽樣列灌歪。
+    df = df[df["StrategyFamily"] != "rate_matched"]
+    if primary_only:
+        df = df[(df["AE"] == PRIMARY_AE) & (df["Config"] == PRIMARY_CONFIG)]
     if df.empty:
         return pd.DataFrame(columns=COMPARISON_EXPORT_COLS)
     out = pd.DataFrame({
@@ -1175,9 +1876,9 @@ def make_ak_export_df(df, config_policy):
     return out[COMPARISON_EXPORT_COLS]
 
 
-def write_ak_export(ws, df, title, config_policy):
+def write_ak_export(ws, df, title, config_policy, primary_only=False):
     ws.title = title
-    out = make_ak_export_df(df, config_policy)
+    out = make_ak_export_df(df, config_policy, primary_only=primary_only)
     for c, h in enumerate(COMPARISON_EXPORT_COLS, 1):
         sc(ws.cell(1, c), h, font=HEADER_FONT, fill=HEADER_FILL, align=CENTER_ALIGN)
     for r, (_, row) in enumerate(out.iterrows(), 2):
@@ -1229,7 +1930,43 @@ def write_alignment_notes(ws):
         ("Data leakage guard", "MinMax fit on training majority only; DF scaler fit on uncleaned DF_maj only; voters use the train fold only; test is transform-only and never participates in sampling or selection."),
         ("Mask cache", f"enabled={CACHE_MASKS} (DF cached={CACHE_DF}) → {CACHE_DIR}. Stores keep masks, original majority row positions, train-file SHA1 and package versions so Route 2 can reuse the SAME representation without retraining the AE."),
         ("Categorical caveat", "parse_keel_dat is byte-identical to A~M and encodes train/test independently. Datasets containing categorical columns are flagged in console and dataset_profile.csv; fixing this requires re-running ALL of A~M, not just N."),
-        ("Merge note", "ak_*_export matches I/J/K column-for-column (Strategy stored in the Sampler column); add this workbook to L_merge SOURCES to combine."),
+        ("ANALYSIS HIERARCHY", "1) primary_config_comparison = CONFIRMATORY, pre-specified "
+         f"{PRIMARY_AE} x {PRIMARY_CONFIG}. 2) rank_stability = selection-free evidence across all configs. "
+         "3) global_none_sel_config and strategy_specific_oracle are EXPLORATORY / post-hoc and must be "
+         "labelled as such in the thesis."),
+        ("Pre-specified config rationale", f"{PRIMARY_CONFIG}: one hidden layer, latent dim = input dim. "
+         "No compression-strength choice is involved, so the only independent variable left is the "
+         "subset-selection strategy. This rationale holds BEFORE seeing any result — it is not 'the config "
+         "that scored best'."),
+        ("Rate-matched scope", f"representative cell only: AE={RM_AE}, configs={'/'.join(RM_CONFIGS)}, "
+         f"repeats={N_RM_REPEATS}. Win/Tie/Loss are reported separately (tie tol={RM_TIE_TOL}) because AUC "
+         "is a rank statistic and exact ties are common on small datasets. Do not extrapolate the position "
+         "effect to other configs."),
+        ("Voter preset caveat", "'expanded' (ENN k=3/5/7 + CNN + TL) gives the ENN family 3 of 5 votes and is "
+         "effectively a weighted ENN, so it is exploratory only. 'diverse' (ENN/CNN/TL/NCR/OSS) is the "
+         "defensible expansion. Main analysis stays on the Study-2-aligned ENN/CNN/TL."),
+        ("Categorical policy", f"{CATEGORICAL_POLICY}. Excluded datasets: "
+         f"{globals().get('_EXCLUDED_CATEGORICAL') or 'none'}"),
+        ("Run isolation", f"outputs live directly under {RESULTS_DIR} with the prefix '{OUT_PREFIX}' "
+         f"(run tag {RUN_TAG}), so they cannot overwrite earlier v2/v3 files. Checkpoints are one file set per "
+         f"dataset under {CKPT_DIR}, cleared before a dataset is re-run. A completion manifest records "
+         f"cells_done vs cells_expected ({expected_cells_per_dataset()}) per dataset; only fully complete "
+         "datasets are skipped on resume, and a changed run signature aborts instead of mixing results."),
+        ("Terminology", "S1_Union == none and S4(ENN∩TL) == ENN are EQUIVALENT (identical training subset). "
+         "S3_Intersection is NOT equivalent — it is a distinct but overly aggressive strategy (~92% removal). "
+         "Correct phrasing: only S2_Majority is both non-equivalent and practically viable. Deletion sets are "
+         "computed in DF space and therefore depend on dataset, AE, config and seed — findings about them are "
+         "scoped to the conditions actually run."),
+        ("DO NOT feed this into L_merge", "L_merge_study2_comparison.py is a Study-2 combiner: it expects an "
+         "ak_best_export sheet and Study-2 sampler semantics. This file deliberately does NOT emit ak_best_export, "
+         "because (a) a per-dataset oracle pick would be an upper bound, not a score, and (b) Study 3 rows are "
+         "strategies, not samplers. Merging would distort both studies. To show N alongside A~M, use "
+         "ak_primary_export (pre-specified AE x config, rate-matched rows excluded) and present it as a separate "
+         "block — never subtract N's absolute AUC from J's."),
+        ("ak export scope", "rate-matched rows are excluded from BOTH ak sheets: they are repeated random draws of "
+         "the same strategy, so any per-Sampler average would be skewed by them. They remain in all_per_fold and "
+         "in rate_matched_gap."),
+        ("Legacy note", "ak_*_export matches I/J/K column-for-column (Strategy stored in the Sampler column); add this workbook to L_merge SOURCES to combine."),
         ("Versions", f"python={platform.python_version()}, numpy={np.__version__}, pandas={pd.__version__}, sklearn={sklearn.__version__}, imblearn={imblearn.__version__}, scipy={scipy.__version__}, torch={torch.__version__}"),
     ]
     sc(ws.cell(1, 1), "Item", font=HEADER_FONT, fill=HEADER_FILL, align=CENTER_ALIGN)
@@ -1243,7 +1980,7 @@ def write_alignment_notes(ws):
     ws.freeze_panes = "A2"
 
 
-def save_excel(df_all, df_overlap, df_invalid):
+def save_excel(df_all, df_overlap, df_invalid, df_equiv=None):
     delta_cols = [f"Δ{m}" for m in ALL_METRIC_COLS] + ["MeanΔAUC", "MedianΔAUC", "GapAUC"]
     policy = "fixed_config_no_oracle" if CONFIG_MODE != "grid" else "all_configs"
 
@@ -1259,6 +1996,12 @@ def save_excel(df_all, df_overlap, df_invalid):
 
     dump_table(wb.create_sheet("strategy_overall"),
                "策略 × OCC 全域平均（含平均刪除率）", build_strategy_overall(df_all))
+
+    dump_table(wb.create_sheet("primary_config_comparison"),
+               f"★★ 主分析（confirmatory）★★ 固定 {PRIMARY_AE} × {PRIMARY_CONFIG}（開跑前寫死）"
+               f"下各策略 vs {PRIMARY_BASELINE} 的 dataset-level 配對比較",
+               build_primary_config_comparison(df_all, PRIMARY_BASELINE),
+               delta_cols=delta_cols)
 
     dump_table(wb.create_sheet("effect_vs_ENN"),
                f"★ Study 3 核心表：相對 {PRIMARY_BASELINE} 的配對 Δ（ensemble 有沒有贏過 single best）",
@@ -1284,11 +2027,38 @@ def save_excel(df_all, df_overlap, df_invalid):
                "三方法【刪除集合】重疊結構：Jaccard / 交集 / 刪除票數分布（含比例欄）",
                build_overlap_summary(df_overlap))
 
+    dump_table(wb.create_sheet("rank_stability"),
+               f"★ 選擇無關的證據：各策略在多少個 config 中贏過 {PRIMARY_BASELINE}"
+               f"（結論不依賴任何一次 config 選擇）",
+               build_rank_stability(df_all, PRIMARY_BASELINE),
+               delta_cols=("MeanΔAUC_overConfigs", "MinΔAUC", "MaxΔAUC"))
+
+    dump_table(wb.create_sheet("config_sensitivity"),
+               "config 敏感度：各 config 在所有資料集上的平均 AUC 與策略排名（不做 per-dataset 挑選）",
+               build_config_sensitivity(df_all))
+
+    dump_table(wb.create_sheet("global_none_sel_config"),
+               "⚠️ 探索性：以 none 條件在所有資料集上平均最佳的 config —— "
+               "以測試 AUC 選出，屬 post-hoc 選模，不可當成事前固定配置",
+               build_global_none_selected_config(df_all))
+
+    dump_table(wb.create_sheet("strategy_specific_oracle"),
+               "⚠️ 每個策略各自挑最佳 config 的 ORACLE 上界 —— 僅供與 12_J 對照，"
+               "不可用於策略優劣比較",
+               build_strategy_specific_oracle(df_all))
+
+    dump_table(wb.create_sheet("strategy_equivalence"),
+               "策略等價：哪些策略產生了完全相同的訓練子集（含有效格子數分母與等價比例）",
+               build_equivalence_summary(
+                   df_equiv if df_equiv is not None else pd.DataFrame(), df_all))
+
     dump_table(wb.create_sheet("invalid_log"),
                "被排除的 cell（voter fallback / 策略退化）——必須在論文中交代",
                df_invalid)
 
     write_ak_export(wb.create_sheet("ak_all_export"), df_all, "ak_all_export", policy)
+    write_ak_export(wb.create_sheet("ak_primary_export"), df_all, "ak_primary_export",
+                    f"pre_specified_{PRIMARY_AE}_{PRIMARY_CONFIG}", primary_only=True)
     write_alignment_notes(wb.create_sheet("alignment_notes"))
 
     wb.save(OUTPUT_FILE)
@@ -1304,7 +2074,7 @@ def flush_warnings():
 # ─────────────────────────── Entry Point ─────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 74)
-    print("Study Three 路線一：集合運算式 Ensemble Under-sampling（DF_maj）v2")
+    print("Study Three 路線一：集合運算式 Ensemble Under-sampling（DF_maj）v3 全跑版")
     print(f"模式       : SCAN_ONLY={SCAN_ONLY} / OVERLAP_ONLY={OVERLAP_ONLY} / RUN_MODE={RUN_MODE}")
     print(f"Seed       : {SEED_MODE}（stable_per_cell 不依賴執行順序）")
     print(f"AE         : {AE_TYPES} | Config: {CONFIG_MODE} → {ACTIVE_CONFIGS}")
@@ -1314,7 +2084,10 @@ if __name__ == "__main__":
     print(f"Rate-match : {ENABLE_RATE_MATCHED}（repeats={N_RM_REPEATS}，逐次保留）")
     print("=" * 74)
 
-    df_all, df_overlap, df_invalid = run_experiment()
+    print_scale_estimate()
+    print("=" * 74)
+    _t0 = perf_counter()
+    df_all, df_overlap, df_invalid, df_equiv = run_experiment()
 
     if SCAN_ONLY:
         flush_warnings()
@@ -1339,7 +2112,7 @@ if __name__ == "__main__":
         flush_warnings()
         sys.exit(0)
 
-    save_excel(df_all, df_overlap, df_invalid)
+    save_excel(df_all, df_overlap, df_invalid, df_equiv)
 
     real = df_all[df_all["StrategyFamily"] != "rate_matched"]
     print("\n── 策略 × OCC 平均 AUC ──")
@@ -1352,10 +2125,39 @@ if __name__ == "__main__":
     ps = build_dataset_level_paired(df_all, PRIMARY_BASELINE)
     if not ps.empty:
         print(f"\n── ★ dataset-level：各策略 vs {PRIMARY_BASELINE} ──")
-        print(ps[["OCC", "Strategy", "nDatasets", "MeanΔAUC",
-                  "Win", "Tie", "Loss", "Wilcoxon_p"]].round(4).to_string(index=False))
+        cols = ["AE", "OCC", "Config", "Strategy", "nDatasets", "MeanΔAUC",
+                "Win", "Tie", "Loss", "Wilcoxon_p"]
+        # grid 模式下每個 config 各一列，只印出主要策略避免洗版
+        ps_show = ps[ps["Role"] != "control"] if "Role" in ps.columns else ps
+        print(ps_show[cols].round(4).to_string(index=False))
+
+    eq = build_equivalence_summary(df_equiv, df_all)
+    if not eq.empty:
+        print("\n── 策略等價（產生完全相同訓練子集的策略對）──")
+        print(eq.to_string(index=False))
+
+    pc = build_primary_config_comparison(df_all, PRIMARY_BASELINE)
+    if not pc.empty:
+        print(f"\n── ★主分析★ 固定 {PRIMARY_AE} × {PRIMARY_CONFIG}：各策略 vs {PRIMARY_BASELINE} ──")
+        print(pc[pc["Role"] != "control"][
+            ["OCC", "Strategy", "nDatasets", "MeanΔAUC", "Win", "Tie", "Loss",
+             "Wilcoxon_p"]].round(4).to_string(index=False))
+
+    rs = build_rank_stability(df_all, PRIMARY_BASELINE)
+    if not rs.empty:
+        print(f"\n── ★選擇無關★ 各策略在多少個 config 中贏過 {PRIMARY_BASELINE} ──")
+        print(rs[rs["Role"] != "control"][
+            ["OCC", "Strategy", "nConfigs", "ConfigsWon", "ConfigWinRate",
+             "MeanΔAUC_overConfigs"]].round(4).to_string(index=False))
+
+    fc = build_global_none_selected_config(df_all)
+    if not fc.empty:
+        print("\n── ⚠️ 探索性：以 none 條件選出的 config（post-hoc，不可當主結果）──")
+        print(fc[["AE", "OCC", "PickedConfig", "none_AUC_at_pick"]].round(4).to_string(index=False))
 
     if not df_invalid.empty:
         print(f"\n⚠️  有 {len(df_invalid)} 個 cell 被排除，詳見 invalid_log 分頁。")
+
+    print(f"\n總耗時：{(perf_counter() - _t0) / 60:.1f} 分鐘")
 
     flush_warnings()
