@@ -1,0 +1,149 @@
+{
+  "hard": {
+    "studies": [
+      "A",
+      "B",
+      "C"
+    ],
+    "ae_types": [
+      "AE",
+      "DAE",
+      "SAE",
+      "VAE"
+    ],
+    "configs": [
+      "h1-1/4",
+      "h1-1/3",
+      "h1-1/2",
+      "h1-1/1",
+      "h1-2/1",
+      "h1-3/1",
+      "h1-4/1",
+      "h2-1/4",
+      "h2-1/3",
+      "h2-1/2",
+      "h2-1/1",
+      "h2-2/1",
+      "h2-3/1",
+      "h2-4/1",
+      "h3-1/4",
+      "h3-1/3",
+      "h3-1/2",
+      "h3-1/1",
+      "h3-2/1",
+      "h3-3/1",
+      "h3-4/1"
+    ],
+    "grid": {
+      "OCSVM": {
+        "nu": [
+          0.01,
+          0.05,
+          0.1,
+          0.2,
+          0.3,
+          0.4,
+          0.5
+        ],
+        "gamma": [
+          "scale",
+          0.01,
+          0.1,
+          1,
+          10,
+          100
+        ]
+      },
+      "LOF": {
+        "n_neighbors": [
+          10,
+          20,
+          30,
+          40,
+          50
+        ]
+      },
+      "iForest": {
+        "n_estimators": [
+          50,
+          100,
+          150,
+          200
+        ],
+        "max_samples": [
+          64,
+          128,
+          256
+        ]
+      }
+    },
+    "legacy_default": {
+      "OCSVM": {
+        "nu": 0.1,
+        "gamma": "scale"
+      },
+      "LOF": {
+        "n_neighbors": 20
+      },
+      "iForest": {
+        "n_estimators": 100,
+        "max_samples": 256
+      }
+    },
+    "ae": {
+      "epochs": 100,
+      "batch": 64,
+      "lr": 0.001,
+      "dae_noise": 0.1,
+      "sae_sparsity": 0.001,
+      "vae_beta": 1.0,
+      "seed_mode": "stable_per_cell_crc32",
+      "global_seed": 42,
+      "scaler": "minmax_fit_train_majority",
+      "code": "22f7afb18af6",
+      "torch_major_minor": "2.10"
+    },
+    "lof_train_score": "fit",
+    "threshold_pct": 90,
+    "metrics": [
+      "AUC",
+      "F1",
+      "Recall",
+      "G-mean",
+      "AP"
+    ],
+    "n_folds": 5
+  },
+  "fingerprints": {
+    "abalone19-5-fold": "04abf375d08726d7",
+    "abalone19-5-fold_Encoding": "04abf375d08726d7",
+    "glass-0-1-6_vs_2-5-fold": "66de690dfc36f293",
+    "glass0-5-fold": "2095bdceca128470",
+    "glass1-5-fold": "d62d07602b67818c",
+    "glass2-5-fold": "f6b42c04ea14e169",
+    "haberman-5-fold": "a9df5789fe9d98ce",
+    "segment0-5-fold": "7a5e0880132d09ad",
+    "vehicle1-5-fold": "746311a1f3344d41",
+    "vehicle2-5-fold": "c3b60b69fa31db07",
+    "vehicle3-5-fold": "8319097de8703ab4",
+    "yeast-0-5-6-7-9_vs_4-5-fold": "4101688867436f37",
+    "yeast-1-2-8-9_vs_7-5-fold": "2fee42fd4d48124b",
+    "yeast-1-4-5-8_vs_7-5-fold": "f1298a654ae7c2a6",
+    "yeast-1_vs_7-5-fold": "0d1284aed97b5de0",
+    "yeast-2_vs_8-5-fold": "863d1f634257834b",
+    "yeast1-5-fold": "86bced85017b09fd"
+  },
+  "sessions": [
+    {
+      "time": "2026-09-21 23:24:56",
+      "host": "58-0465129-H1",
+      "n_jobs": 4,
+      "python": "3.10.11",
+      "numpy": "2.2.6",
+      "pandas": "2.3.3",
+      "sklearn": "1.7.2",
+      "torch": "2.10.0+cpu",
+      "platform": "Windows-10-10.0.26200-SP0"
+    }
+  ]
+}
